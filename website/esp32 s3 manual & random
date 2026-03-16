@@ -1,0 +1,94 @@
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+#define WIFI_SSID "gojo"
+#define WIFI_PASSWORD "nakul2006"
+#define API_KEY       "AIzaSyDDljNw-RQkVzjo_EJwb3l6WqGcZTmcUp0"
+#define DATABASE_URL  "https://sairam-innovathon-vitals-default-rtdb.europe-west1.firebasedatabase.app/"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+bool signupOK = false;
+
+// Base values
+int   bHR  = 80;
+float bTemp = 36.5;
+int   bRR  = 16;
+int   bSBP = 120;
+int   bDBP = 80;
+bool  manualMode = false;
+unsigned long lastSend = 0;
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  Serial.println("\n✅ WiFi Connected: " + WiFi.localIP().toString());
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  config.token_status_callback = tokenStatusCallback; // CRITICAL
+
+  if (Firebase.signUp(&config, &auth, "", "")) {      // CRITICAL - anonymous
+    Serial.println("✅ Firebase Auth OK");
+    signupOK = true;
+  } else {
+    Serial.println("❌ Firebase Auth FAILED: " + String(config.signer.signupError.message.c_str()));
+  }
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.println("Format: hr,temp,rr,sbp,dbp  e.g. 75,36.8,16,118,78");
+}
+
+void loop() {
+  if (Serial.available()) {
+    String inp = Serial.readStringUntil('\n');
+    inp.trim();
+    // Parse 5 comma-separated values
+    int v[5]; int idx = 0; String tmp = inp;
+    while (tmp.length() && idx < 5) {
+      int c = tmp.indexOf(',');
+      String seg = (c == -1) ? tmp : tmp.substring(0, c);
+      v[idx++] = (idx == 2) ? 0 : seg.toInt(); // temp handled separately
+      if (c == -1) break; else tmp = tmp.substring(c + 1);
+    }
+    // Re-parse temp as float
+    int c1 = inp.indexOf(',');
+    int c2 = inp.indexOf(',', c1 + 1);
+    float parsedTemp = inp.substring(c1 + 1, c2).toFloat();
+
+    bHR = v[0]; bTemp = parsedTemp;
+    bRR = v[2]; bSBP = v[3]; bDBP = v[4];
+    manualMode = true;
+    Serial.printf("✅ Manual: HR=%d Temp=%.1f RR=%d BP=%d/%d\n", bHR, bTemp, bRR, bSBP, bDBP);
+  }
+
+  if (millis() - lastSend > 3000 && Firebase.ready() && signupOK) {
+    int   hr  = manualMode ? bHR  : bHR  + random(-3, 4);
+    float tmp = manualMode ? bTemp: bTemp + random(-2, 3) / 10.0;
+    int   rr  = manualMode ? bRR  : bRR  + random(-1, 2);
+    int   sbp = manualMode ? bSBP : bSBP + random(-4, 5);
+    int   dbp = manualMode ? bDBP : bDBP + random(-2, 3);
+
+    FirebaseJson json;
+    json.set("heartRate",      hr);
+    json.set("temperature",    tmp);
+    json.set("respiratoryRate",rr);
+    json.set("bloodPressure",  String(sbp) + "/" + String(dbp));
+    json.set("activity",       "Active");
+    json.set("timestamp",      String(millis()));
+
+    if (Firebase.RTDB.setJSON(&fbdo, "/vitals/device_1", &json)) {
+      Serial.printf("✅ Sent → HR:%d Temp:%.1f RR:%d BP:%d/%d\n", hr, tmp, rr, sbp, dbp);
+    } else {
+      Serial.println("❌ Send FAILED: " + fbdo.errorReason());
+    }
+    lastSend = millis();
+  }
+}
