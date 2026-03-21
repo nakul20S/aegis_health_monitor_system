@@ -5,3 +5,29 @@ https://docs.openclaw.ai/cli --- ref for command open claw
 
  Gateway token (blank to generate)
 │  381f314b5377de8fa2228b37f60b4b73416a29b82059329d█
+
+┌─────────────────────────────────────────┐
+│         ORACLE CLOUD (24/7)             │
+│                                         │
+│  OpenClaw Gateway (ONE instance)        │
+│  ├── Brain: Gemini 2.5 Flash (API)      │
+│  ├── Memory: persistent (cloud storage) │
+│  ├── Telegram: connected                │
+│  └── All conversations stored here      │
+└──────────────┬──────────────────────────┘
+               │
+         Tailscale VPN
+         (encrypted tunnel)
+               │
+┌──────────────┴──────────────────────────┐
+│         YOUR LAPTOP (local)             │
+│                                         │
+│  Browser → accesses cloud NEXUS UI      │
+│  Voice layer (Whisper + TTS)            │
+│  ├── Listens locally                    │
+│  ├── Sends text to cloud NEXUS          │
+│  ├── Gets reply back                    │
+│  └── Speaks reply aloud                 │
+│  Ollama → offline fallback only         │
+│  Files → local access skill             │
+└─────────────────────────────────────────┘
