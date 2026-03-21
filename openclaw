@@ -1,5 +1,9 @@
 AIzaSyCXyo90vsRyk8yxG247THMx3sjn2y2bJNc ----- google ai studio api key
 
+http://127.0.0.1:18789/#token=3159c9a640786b16b3b6906c28c725926511491bedf85de7
+
+https://laptop-q098nrun.tail82ef36.ts.net/
+
 
 https://docs.openclaw.ai/cli --- ref for command open claw
 
@@ -31,3 +35,9 @@ https://docs.openclaw.ai/cli --- ref for command open claw
 │  Ollama → offline fallback only         │
 │  Files → local access skill             │
 └─────────────────────────────────────────┘
+
+"Offline NEXUS" = not possible yet
+Full offline JARVIS needs:
+→ Local web server (no cloud needed)
+→ Local Telegram alternative
+→ This is Phase 4 (Month 2)
