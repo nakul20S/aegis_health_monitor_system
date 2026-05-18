@@ -1,0 +1,227 @@
+// ============================================
+// Aegis Solution — Receiver Firmware v1.0
+// Hardware: ESP32 Dev Module
+//
+// FUNCTION:
+//   - Receives ESP-NOW packets from Armband (ESP32-S3 XIAO)
+//   - Forwards data to Firebase Realtime Database via WiFi
+//
+// FILL IN:
+//   - WIFI_SSID
+//   - WIFI_PASSWORD
+//
+// Firebase Project : sairam-innovathon-vitals (europe-west1)
+// DB Path          : /vitals/device_1
+// ============================================
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ============================================================
+// FILL THESE IN
+// ============================================================
+#define WIFI_SSID       "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD   "YOUR_WIFI_PASSWORD"
+
+// ============================================================
+// FIREBASE CONFIG (same project as before)
+// ============================================================
+#define API_KEY       "AIzaSyDDljNw-RQkVzjo_EJwb3l6WqGcZTmcUp0"
+#define DATABASE_URL  "https://sairam-innovathon-vitals-default-rtdb.europe-west1.firebasedatabase.app/"
+#define DB_PATH       "/vitals/device_1"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+bool firebaseReady = false;
+
+// ============================================================
+// ESP-NOW DATA STRUCT — must match sender exactly
+// ============================================================
+typedef struct __attribute__((packed)) {
+  uint8_t       user_id;
+  int           bpm;
+  float         temperature;
+  int           blood_pressure_sbp;
+  int           blood_pressure_dbp;
+  int           respiratory_rate;
+  int           activeness;
+  int           emergency;
+  int           fall_detected;
+  int           lead_off;
+  unsigned long timestamp;
+} HealthData;
+
+// ============================================================
+// SHARED DATA BETWEEN ESP-NOW CALLBACK & MAIN LOOP
+// ============================================================
+volatile bool    newDataAvailable = false;
+HealthData       latestData;
+portMUX_TYPE     dataMux = portMUX_INITIALIZER_UNLOCKED;
+
+// ============================================================
+// ESP-NOW RECEIVE CALLBACK
+// Runs in ISR context — keep it minimal, just copy data
+// ============================================================
+void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
+    if (len != sizeof(HealthData)) {
+        Serial.printf("[WARN] Packet size mismatch: got %d, expected %d\n", len, sizeof(HealthData));
+        return;
+    }
+    portENTER_CRITICAL_ISR(&dataMux);
+    memcpy((void*)&latestData, incomingData, sizeof(HealthData));
+    newDataAvailable = true;
+    portEXIT_CRITICAL_ISR(&dataMux);
+}
+
+// ============================================================
+// FIREBASE INIT
+// ============================================================
+void initFirebase() {
+    config.api_key       = API_KEY;
+    config.database_url  = DATABASE_URL;
+    config.token_status_callback = tokenStatusCallback;
+
+    if (Firebase.signUp(&config, &auth, "", "")) {
+        Serial.println("[OK] Firebase anonymous auth success.");
+        firebaseReady = true;
+    } else {
+        Serial.printf("[FAIL] Firebase auth failed: %s\n", config.signer.signupError.message.c_str());
+        firebaseReady = false;
+    }
+
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+}
+
+// ============================================================
+// WIFI INIT
+// ============================================================
+void initWiFi() {
+    // ESP-NOW + WiFi coexistence:
+    // Must set WiFi to STA mode BEFORE esp_now_init()
+    // WiFi channel must match sender (default ch1)
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    Serial.print("[INFO] Connecting to WiFi");
+    int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 30) {
+        delay(500);
+        Serial.print(".");
+        retries++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\n[OK] WiFi connected: " + WiFi.localIP().toString());
+        Serial.print("[INFO] Receiver MAC: ");
+        Serial.println(WiFi.macAddress());
+    } else {
+        Serial.println("\n[WARN] WiFi failed. Firebase upload disabled. ESP-NOW still active.");
+    }
+}
+
+// ============================================================
+// ESP-NOW INIT
+// Must be called AFTER WiFi.mode(WIFI_STA)
+// ============================================================
+void initESPNOW() {
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[FATAL] ESP-NOW init failed.");
+        while (true);
+    }
+    esp_now_register_recv_cb(onDataReceived);
+    Serial.println("[OK] ESP-NOW initialized. Waiting for packets...");
+}
+
+// ============================================================
+// PUSH TO FIREBASE
+// ============================================================
+void pushToFirebase(HealthData &d) {
+    if (!firebaseReady || !Firebase.ready()) {
+        Serial.println("[WARN] Firebase not ready. Skipping upload.");
+        return;
+    }
+
+    FirebaseJson json;
+    json.set("heartRate",         d.bpm);
+    json.set("temperature",       d.temperature);
+    json.set("bloodPressureSBP",  d.blood_pressure_sbp);
+    json.set("bloodPressureDBP",  d.blood_pressure_dbp);
+    json.set("respiratoryRate",   d.respiratory_rate);
+    json.set("activeness",        d.activeness);
+    json.set("emergency",         d.emergency);
+    json.set("fallDetected",      d.fall_detected);
+    json.set("leadOff",           d.lead_off);
+    json.set("userId",            d.user_id);
+    json.set("timestamp",         (int)millis());
+
+    // Formatted BP string for dashboard display
+    String bpStr = String(d.blood_pressure_sbp) + "/" + String(d.blood_pressure_dbp);
+    json.set("bloodPressure", bpStr);
+
+    // Human-readable activity + alert status
+    json.set("activity",    d.activeness ? "Active" : "Inactive");
+    json.set("alertStatus", d.emergency  ? "EMERGENCY" :
+                            d.fall_detected ? "FALL" :
+                            d.lead_off  ? "SENSOR_OFF" : "Normal");
+
+    if (Firebase.RTDB.setJSON(&fbdo, DB_PATH, &json)) {
+        Serial.println("[Firebase] ✅ Upload success.");
+    } else {
+        Serial.printf("[Firebase] ❌ Upload failed: %s\n", fbdo.errorReason().c_str());
+    }
+}
+
+// ============================================================
+// SERIAL PRINT
+// ============================================================
+void printReceived(HealthData &d) {
+    Serial.println("========================================");
+    Serial.println("[ESP-NOW] Packet received:");
+    Serial.printf("  User ID : %d\n",       d.user_id);
+    Serial.printf("  HR      : %d bpm\n",   d.bpm);
+    Serial.printf("  BP      : %d/%d mmHg\n", d.blood_pressure_sbp, d.blood_pressure_dbp);
+    Serial.printf("  RR      : %d br/min\n", d.respiratory_rate);
+    Serial.printf("  Temp    : %.1f C\n",   d.temperature);
+    Serial.printf("  Activity: %s\n",       d.activeness ? "Active" : "Inactive");
+    Serial.printf("  LO      : %s\n",       d.lead_off   ? "DISCONNECTED" : "OK");
+    Serial.printf("  Fall    : %s\n",       d.fall_detected ? "YES" : "No");
+    Serial.printf("  EMG     : %s\n",       d.emergency  ? "ACTIVE" : "OFF");
+    Serial.println("========================================");
+}
+
+// ============================================================
+// SETUP & LOOP
+// ============================================================
+void setup() {
+    Serial.begin(115200);
+    Serial.println("\n========================================");
+    Serial.println(" Aegis Receiver v1.0");
+    Serial.println(" ESP-NOW → Firebase");
+    Serial.println("========================================");
+
+    initWiFi();
+    initESPNOW();   // after WiFi mode set
+    initFirebase(); // after WiFi connected
+}
+
+void loop() {
+    if (newDataAvailable) {
+        // Copy data out of volatile buffer safely
+        HealthData localCopy;
+        portENTER_CRITICAL(&dataMux);
+        memcpy(&localCopy, (void*)&latestData, sizeof(HealthData));
+        newDataAvailable = false;
+        portEXIT_CRITICAL(&dataMux);
+
+        printReceived(localCopy);
+        pushToFirebase(localCopy);
+    }
+
+    delay(10);
+}
