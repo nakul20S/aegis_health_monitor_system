@@ -1,0 +1,471 @@
+// ============================================
+// Aegis Solution — Armband Firmware v2.0
+// Hardware: XIAO ESP32-S3 + AD8232 + Button
+//
+// CHANGES FROM v1.0:
+//   - Activity → Active only if LO connected, else 0
+//   - Temperature → random 36.0–37.5°C if LO connected, else 0
+//   - ESP-NOW added → sends to ESP32 receiver every 5 seconds
+//   - 5-second averaging buffer for all vitals before transmission
+//
+// RECEIVER MAC: 68:25:DD:31:FB:60 (ESP32 Dev Module)
+// OUTPUT: Serial Monitor @ 115200 baud
+// ============================================
+
+#include <Arduino.h>
+#include <math.h>
+#include <esp_now.h>
+#include <WiFi.h>
+
+// ============================================================
+// PIN MAP (XIAO ESP32-S3)
+// ============================================================
+#define ECG_OUTPUT_PIN    0
+#define LO_PLUS_PIN       2
+#define LO_MINUS_PIN      21
+#define EMERGENCY_BTN_PIN 19
+
+// ============================================================
+// ESP-NOW CONFIG
+// ============================================================
+uint8_t receiverMAC[] = { 0x68, 0x25, 0xDD, 0x31, 0xFB, 0x60 };
+
+typedef struct __attribute__((packed)) {
+  uint8_t       user_id;
+  int           bpm;
+  float         temperature;
+  int           blood_pressure_sbp;
+  int           blood_pressure_dbp;
+  int           respiratory_rate;
+  int           activeness;
+  int           emergency;
+  int           fall_detected;   // always 0 — no IMU
+  int           lead_off;
+  unsigned long timestamp;
+} HealthData;
+
+void onDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+    Serial.print("[ESP-NOW] Send status: ");
+    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+}
+
+void initESPNOW() {
+    WiFi.mode(WIFI_STA);
+    Serial.print("[INFO] Sender MAC: ");
+    Serial.println(WiFi.macAddress());
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[FATAL] ESP-NOW init failed.");
+        while (true);
+    }
+    esp_now_register_send_cb(onDataSent);
+
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, receiverMAC, 6);
+    peer.channel = 0;  // default channel 1
+    peer.encrypt = false;
+
+    if (esp_now_add_peer(&peer) != ESP_OK) {
+        Serial.println("[FATAL] Failed to add peer.");
+        while (true);
+    }
+    Serial.println("[OK] ESP-NOW initialized. Receiver peer added.");
+}
+
+// ============================================================
+// ECG PARAMETERS (UNCHANGED)
+// ============================================================
+const int   BASELINE_WINDOW      = 200;
+const int   PEAK_WINDOW          = 30;
+const int   MIN_BEAT_INTERVAL    = 500;
+const float PEAK_THRESHOLD_RATIO = 0.6f;
+const int   MIN_PEAK_HEIGHT      = 50;
+const int   MIN_SIGNAL_RANGE     = 100;
+const int   REFRACTORY_PERIOD    = 350;
+const int   CALIBRATION_SAMPLES  = 100;
+
+const unsigned long LEAD_OFF_DEBOUNCE_MS = 500;
+bool          isCurrentlyDisconnected = false;
+unsigned long disconnectStartTime     = 0;
+
+int   baselineBuffer[BASELINE_WINDOW] = {0};
+float bpmBuffer[8]                    = {0};
+int   recentSamples[PEAK_WINDOW]      = {0};
+int   baselineIndex    = 0;
+int   bpmIndex         = 0;
+int   sampleIndex      = 0;
+int   currentBaseline  = 2048;
+int   dynamicThreshold = 2048;
+int   lastPeakValue    = 0;
+float reliableBPM      = 0.0f;
+bool  isCalibrated     = false;
+int   calibrationCount = 0;
+
+unsigned long lastBeatTime      = 0;
+unsigned long refractoryEndTime = 0;
+unsigned long lastThreshUpdate  = 0;
+
+bool ecg_electrodes_ok = false;
+
+// ============================================================
+// VITALS LOOKUP TABLE (UNCHANGED)
+// ============================================================
+struct VitalsMapping { int hr; float sbp; float dbp; float rr; };
+const VitalsMapping vitals_table[] = {
+    {60, 110, 70, 12.0}, {65, 110, 70, 12.0}, {70, 110, 70, 12.0},
+    {75, 110, 70, 12.0}, {80, 114, 70, 12.1}, {85, 118, 70, 12.4},
+    {90, 122, 70, 12.8}, {95, 126, 70, 13.2}, {100, 130, 70, 13.6},
+    {105, 134, 70, 14.1},{110, 138, 70, 14.7},{115, 142, 70, 15.3},
+    {120, 146, 70, 15.9},{125, 150, 70, 16.6},{130, 154, 70, 17.3},
+    {135, 158, 70, 18.0},{140, 162, 70, 18.8},{145, 166, 70, 19.6},
+    {150, 170, 70, 20.4},{155, 174, 70, 21.3},{160, 178, 70, 22.1},
+    {165, 182, 70, 23.0},{170, 186, 70, 24.0},{175, 190, 70, 24.9},
+    {180, 194, 70, 25.9}
+};
+const int VITALS_TABLE_SIZE = sizeof(vitals_table) / sizeof(vitals_table[0]);
+
+float currentSBP = 0.0f;
+float currentDBP = 0.0f;
+float currentRR  = 0.0f;
+
+// ============================================================
+// SIMULATED TEMPERATURE
+// Tied to LO status: connected → 36.0–37.5°C, else 0
+// ============================================================
+float         simulatedTemp   = 0.0f;
+unsigned long lastTempUpdate  = 0;
+const unsigned long TEMP_UPDATE_INTERVAL_MS = 5000;
+
+void updateSimulatedTemp() {
+    if (!ecg_electrodes_ok) { simulatedTemp = 0.0f; return; }
+    if (millis() - lastTempUpdate < TEMP_UPDATE_INTERVAL_MS) return;
+    lastTempUpdate = millis();
+    simulatedTemp  = 36.0f + (float)(random(0, 16)) * 0.1f; // 36.0–37.5
+}
+
+// ============================================================
+// EMERGENCY BUTTON (toggle — unchanged)
+// ============================================================
+bool          emergencyActiveState = false;
+bool          emergencyPressed     = false;
+unsigned long lastButtonCheck      = 0;
+const unsigned long BUTTON_DEBOUNCE_MS = 50;
+
+void updateEmergencyButton() {
+    static int lastButtonState = HIGH;
+    if (millis() - lastButtonCheck < BUTTON_DEBOUNCE_MS) return;
+    lastButtonCheck = millis();
+
+    int cur = digitalRead(EMERGENCY_BTN_PIN);
+    if (lastButtonState == HIGH && cur == LOW) {
+        emergencyActiveState = !emergencyActiveState;
+    }
+    lastButtonState  = cur;
+    emergencyPressed = emergencyActiveState;
+}
+
+// ============================================================
+// 5-SECOND AVERAGING BUFFER
+// ============================================================
+const unsigned long TX_INTERVAL_MS = 5000;
+unsigned long lastTxTime = 0;
+
+float avg_bpm_samples[5]  = {0};
+float avg_sbp_samples[5]  = {0};
+float avg_dbp_samples[5]  = {0};
+float avg_rr_samples[5]   = {0};
+float avg_temp_samples[5] = {0};
+int   avg_count           = 0;
+
+unsigned long lastSampleTime = 0;
+const unsigned long SAMPLE_INTERVAL_MS = 1000; // 1 sample/sec → 5 samples in 5s
+
+void collectSample() {
+    if (millis() - lastSampleTime < SAMPLE_INTERVAL_MS) return;
+    lastSampleTime = millis();
+    if (avg_count >= 5) return; // buffer full, wait for TX
+
+    avg_bpm_samples[avg_count]  = ecg_electrodes_ok ? reliableBPM  : 0;
+    avg_sbp_samples[avg_count]  = ecg_electrodes_ok ? currentSBP   : 0;
+    avg_dbp_samples[avg_count]  = ecg_electrodes_ok ? currentDBP   : 0;
+    avg_rr_samples[avg_count]   = ecg_electrodes_ok ? currentRR    : 0;
+    avg_temp_samples[avg_count] = ecg_electrodes_ok ? simulatedTemp : 0;
+    avg_count++;
+}
+
+float calcAverage(float* arr, int count) {
+    if (count == 0) return 0;
+    float sum = 0; int valid = 0;
+    for (int i = 0; i < count; i++) {
+        if (arr[i] > 0) { sum += arr[i]; valid++; }
+    }
+    return (valid > 0) ? (sum / valid) : 0;
+}
+
+void resetAvgBuffers() {
+    avg_count = 0;
+    for (int i = 0; i < 5; i++) {
+        avg_bpm_samples[i] = avg_sbp_samples[i] = avg_dbp_samples[i] =
+        avg_rr_samples[i]  = avg_temp_samples[i] = 0;
+    }
+}
+
+void sendESPNOW() {
+    if (millis() - lastTxTime < TX_INTERVAL_MS) return;
+    lastTxTime = millis();
+
+    HealthData data;
+    data.user_id            = 1;
+    data.timestamp          = millis();
+    data.lead_off           = ecg_electrodes_ok ? 0 : 1;
+    data.activeness         = ecg_electrodes_ok ? 1 : 0; // Active only if LO connected
+    data.emergency          = emergencyPressed ? 1 : 0;
+    data.fall_detected      = 0; // No IMU
+    data.bpm                = (int)calcAverage(avg_bpm_samples,  avg_count);
+    data.blood_pressure_sbp = (int)calcAverage(avg_sbp_samples,  avg_count);
+    data.blood_pressure_dbp = (int)calcAverage(avg_dbp_samples,  avg_count);
+    data.respiratory_rate   = (int)calcAverage(avg_rr_samples,   avg_count);
+    data.temperature        = calcAverage(avg_temp_samples, avg_count);
+
+    Serial.println("========================================");
+    Serial.println("[ESP-NOW] Transmitting 5s averaged data:");
+    Serial.printf("  HR:   %d bpm\n",       data.bpm);
+    Serial.printf("  BP:   %d/%d mmHg\n",   data.blood_pressure_sbp, data.blood_pressure_dbp);
+    Serial.printf("  RR:   %d br/min\n",    data.respiratory_rate);
+    Serial.printf("  Temp: %.1f C\n",       data.temperature);
+    Serial.printf("  LO:   %s\n",           data.lead_off ? "DISCONNECTED" : "OK");
+    Serial.printf("  Act:  %s\n",           data.activeness ? "Active" : "Inactive");
+    Serial.printf("  EMG:  %s\n",           data.emergency  ? "ACTIVE" : "OFF");
+    Serial.println("========================================");
+
+    esp_now_send(receiverMAC, (uint8_t*)&data, sizeof(data));
+    resetAvgBuffers();
+}
+
+// ============================================================
+// ECG FUNCTIONS (UNCHANGED LOGIC)
+// ============================================================
+float lerp(float x0, float y0, float x1, float y1, float x) {
+    if (x1 == x0) return y0;
+    return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+}
+
+void resetECGSystem() {
+    isCalibrated     = false;
+    calibrationCount = 0;
+    lastBeatTime     = 0;
+    refractoryEndTime = 0;
+    for (int i = 0; i < 8; i++) bpmBuffer[i] = 0;
+    bpmIndex     = 0;
+    reliableBPM  = 0;
+    currentSBP   = 0; currentDBP = 0; currentRR = 0;
+    dynamicThreshold = 2048;
+    Serial.println("[INFO] ECG system reset.");
+}
+
+bool checkElectrodeConnection() {
+    bool loPlus  = digitalRead(LO_PLUS_PIN);
+    bool loMinus = digitalRead(LO_MINUS_PIN);
+    bool rawBad  = loPlus || loMinus;
+    unsigned long now = millis();
+
+    if (rawBad) {
+        if (!isCurrentlyDisconnected) {
+            disconnectStartTime     = now;
+            isCurrentlyDisconnected = true;
+        }
+        if (now - disconnectStartTime > LEAD_OFF_DEBOUNCE_MS) {
+            ecg_electrodes_ok = false;
+        }
+    } else {
+        isCurrentlyDisconnected = false;
+        ecg_electrodes_ok       = true;
+    }
+    return ecg_electrodes_ok;
+}
+
+void updateDynamicThreshold() {
+    if (!isCalibrated) return;
+    int minVal = 4095, maxVal = 0;
+    for (int i = 0; i < PEAK_WINDOW; i++) {
+        if (recentSamples[i] < minVal) minVal = recentSamples[i];
+        if (recentSamples[i] > maxVal) maxVal = recentSamples[i];
+    }
+    int signalRange = maxVal - minVal;
+    dynamicThreshold = (signalRange > MIN_SIGNAL_RANGE)
+        ? currentBaseline + (int)(signalRange * PEAK_THRESHOLD_RATIO)
+        : currentBaseline + MIN_PEAK_HEIGHT;
+}
+
+bool robustBeatDetection(int ecgValue) {
+    static int  maxPeakInRegion = 0;
+    static bool inPeakRegion    = false;
+
+    if (ecgValue > dynamicThreshold) {
+        if (!inPeakRegion) {
+            inPeakRegion    = true;
+            maxPeakInRegion = ecgValue;
+        } else {
+            if (ecgValue > maxPeakInRegion) maxPeakInRegion = ecgValue;
+        }
+    } else {
+        if (inPeakRegion) {
+            inPeakRegion = false;
+            if (maxPeakInRegion > currentBaseline + MIN_PEAK_HEIGHT) {
+                lastPeakValue = maxPeakInRegion;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+int processECG() {
+    static bool wasConnected = true;
+
+    if (!checkElectrodeConnection()) {
+        if (wasConnected) {
+            Serial.println("[WARN] ECG electrodes disconnected.");
+            resetECGSystem();
+            wasConnected = false;
+        }
+        return 0;
+    }
+    if (!wasConnected) {
+        Serial.println("[INFO] ECG electrodes reconnected.");
+        wasConnected = true;
+    }
+
+    int rawECG      = analogRead(ECG_OUTPUT_PIN);
+    int filteredECG = (recentSamples[sampleIndex] + rawECG) / 2;
+
+    recentSamples[sampleIndex]    = filteredECG;
+    sampleIndex = (sampleIndex + 1) % PEAK_WINDOW;
+    baselineBuffer[baselineIndex] = filteredECG;
+    baselineIndex = (baselineIndex + 1) % BASELINE_WINDOW;
+
+    long bsum = 0;
+    for (int i = 0; i < BASELINE_WINDOW; i++) bsum += baselineBuffer[i];
+    currentBaseline = bsum / BASELINE_WINDOW;
+
+    if (!isCalibrated) {
+        calibrationCount++;
+        if (calibrationCount >= CALIBRATION_SAMPLES) {
+            isCalibrated = true;
+            updateDynamicThreshold();
+            Serial.println("[OK] ECG calibrated. Beat detection active.");
+        }
+        return rawECG;
+    }
+
+    unsigned long now = millis();
+    if (now > refractoryEndTime) {
+        if (robustBeatDetection(filteredECG)) {
+            unsigned long interval = (lastBeatTime > 0) ? (now - lastBeatTime) : 0;
+            if (interval > MIN_BEAT_INTERVAL) {
+                float instantBPM = 60000.0f / interval;
+                if (instantBPM > 40 && instantBPM < 200) {
+                    bpmBuffer[bpmIndex] = instantBPM;
+                    bpmIndex = (bpmIndex + 1) % 8;
+                }
+            }
+            lastBeatTime      = now;
+            refractoryEndTime = now + REFRACTORY_PERIOD;
+        }
+    }
+
+    float bpmSum = 0; int cnt = 0;
+    for (int i = 0; i < 8; i++) {
+        if (bpmBuffer[i] > 0) { bpmSum += bpmBuffer[i]; cnt++; }
+    }
+    if (cnt > 0) reliableBPM = bpmSum / cnt;
+
+    if (now - lastThreshUpdate > 500) {
+        updateDynamicThreshold();
+        lastThreshUpdate = now;
+    }
+    return rawECG;
+}
+
+void updateVitalsFromBPM() {
+    if (reliableBPM == 0) { currentSBP = 0; currentDBP = 0; currentRR = 0; return; }
+    if (reliableBPM < vitals_table[0].hr) {
+        currentSBP = vitals_table[0].sbp; currentDBP = vitals_table[0].dbp;
+        currentRR  = vitals_table[0].rr;  return;
+    }
+    if (reliableBPM >= vitals_table[VITALS_TABLE_SIZE - 1].hr) {
+        currentSBP = vitals_table[VITALS_TABLE_SIZE-1].sbp;
+        currentDBP = vitals_table[VITALS_TABLE_SIZE-1].dbp;
+        currentRR  = vitals_table[VITALS_TABLE_SIZE-1].rr; return;
+    }
+    int lower = 0;
+    for (int i = 0; i < VITALS_TABLE_SIZE - 1; i++) {
+        if (reliableBPM >= vitals_table[i].hr && reliableBPM < vitals_table[i+1].hr) {
+            lower = i; break;
+        }
+    }
+    currentSBP = lerp(vitals_table[lower].hr, vitals_table[lower].sbp,
+                      vitals_table[lower+1].hr, vitals_table[lower+1].sbp, reliableBPM);
+    currentDBP = vitals_table[lower].dbp;
+    currentRR  = lerp(vitals_table[lower].hr, vitals_table[lower].rr,
+                      vitals_table[lower+1].hr, vitals_table[lower+1].rr, reliableBPM);
+}
+
+// ============================================================
+// SERIAL PRINT — every 1 second
+// ============================================================
+unsigned long lastPrint = 0;
+
+void printStatus(int rawECG) {
+    if (millis() - lastPrint < 1000) return;
+    lastPrint = millis();
+
+    Serial.println("----------------------------------------");
+    Serial.printf("[VITALS] HR: %d bpm | BP: %d/%d mmHg | RR: %d br/min | Temp: %.1f C | Activity: %s | LO: %s | EMG: %s\n",
+        (int)reliableBPM,
+        (int)currentSBP, (int)currentDBP,
+        (int)currentRR,
+        simulatedTemp,
+        ecg_electrodes_ok ? "Active"       : "Inactive",
+        ecg_electrodes_ok ? "OK"           : "DISCONNECTED",
+        emergencyPressed  ? "ACTIVE"        : "OFF"
+    );
+    Serial.printf("[DEBUG] ECG Raw: %d | Threshold: %d | Samples buffered: %d/5\n",
+        rawECG, dynamicThreshold, avg_count);
+    Serial.println("----------------------------------------");
+}
+
+// ============================================================
+// SETUP & LOOP
+// ============================================================
+void setup() {
+    Serial.begin(115200);
+
+    pinMode(LO_PLUS_PIN,       INPUT_PULLUP);
+    pinMode(LO_MINUS_PIN,      INPUT_PULLUP);
+    pinMode(EMERGENCY_BTN_PIN, INPUT_PULLUP);
+
+    randomSeed(analogRead(1));
+
+    initESPNOW();
+
+    Serial.println("\n========================================");
+    Serial.println(" Aegis Armband v2.0 — ESP-NOW + ECG");
+    Serial.println(" TX every 5s | Avg over 5 samples");
+    Serial.println("========================================");
+}
+
+void loop() {
+    int rawECG = processECG();
+
+    updateVitalsFromBPM();
+    updateSimulatedTemp();
+    updateEmergencyButton();
+
+    collectSample();   // 1 sample/sec into 5-slot buffer
+    sendESPNOW();      // fires every 5s, sends averaged data
+
+    printStatus(rawECG);
+
+    delay(1);
+}
