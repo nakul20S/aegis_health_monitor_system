@@ -20,10 +20,10 @@
 // ============================================================
 // PIN MAP (XIAO ESP32-S3)
 // ============================================================
-#define ECG_OUTPUT_PIN    0
-#define LO_PLUS_PIN       2
-#define LO_MINUS_PIN      21
-#define EMERGENCY_BTN_PIN 19
+#define ECG_OUTPUT_PIN    1
+#define LO_PLUS_PIN       3
+#define LO_MINUS_PIN      4
+#define EMERGENCY_BTN_PIN 5
 
 // ============================================================
 // ESP-NOW CONFIG
