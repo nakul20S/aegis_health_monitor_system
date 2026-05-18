@@ -24,8 +24,8 @@
 // ============================================================
 // FILL THESE IN
 // ============================================================
-#define WIFI_SSID       "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD   "YOUR_WIFI_PASSWORD"
+#define WIFI_SSID       "San"
+#define WIFI_PASSWORD   "12345678"
 
 // ============================================================
 // FIREBASE CONFIG (same project as before)
@@ -67,7 +67,7 @@ portMUX_TYPE     dataMux = portMUX_INITIALIZER_UNLOCKED;
 // ESP-NOW RECEIVE CALLBACK
 // Runs in ISR context — keep it minimal, just copy data
 // ============================================================
-void onDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
+void onDataReceived(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
     if (len != sizeof(HealthData)) {
         Serial.printf("[WARN] Packet size mismatch: got %d, expected %d\n", len, sizeof(HealthData));
         return;
