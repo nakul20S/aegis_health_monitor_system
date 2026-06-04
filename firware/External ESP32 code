@@ -1,0 +1,804 @@
+// ===== OUTER HUB (RS485 → Tower Light + Supabase for web) =====
+// - FIXED: Added proper RS485 direction control for any potential TX
+// - FIXED: Improved line parsing robustness
+// - FIXED: Better error handling and diagnostics
+// - Enhanced radar debounce logic and clear-to-GREEN timing
+// - MODIFIED: Supabase payload now matches the specific user-provided schema.
+// - UPDATED: Body activity logic simplified to "Fall detected" or "Active".
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <WiFiClientSecure.h>
+#include <map>
+
+// ---------------- Board / Pins / UART ----------------
+#define RS485_UART_NUM 1
+#define RS485_RXD      20
+#define RS485_TXD      21
+#define RS485_DIR_PIN  7
+
+// Tower light pins
+#define PIN_GREEN  6
+#define PIN_YELLOW 5
+#define PIN_RED    4
+
+// ---------------- Timing & thresholds ----------------
+static const unsigned long TIMEOUT_MS              = 30000;  // Reduced timeout
+static const uint8_t       CRIT_THRESH_REST        = 3;
+static const uint8_t       CRIT_THRESH_MOTION      = 5;
+static const uint8_t       LEADOFF_WARN_COUNT      = 3;
+static const unsigned long BLINK_FAST_MS           = 500;
+static const unsigned long BLINK_SLOW_MS           = 1000;
+static const unsigned long HOLD_FALL_MS            = 45000;
+static const unsigned long POST_MIN_INTERVAL_MS    = 2000;   // Increased interval
+static const uint8_t       RADAR_ONLY_ARM_READINGS = 3;
+
+// Radar cooperation for falls
+static const unsigned long RADAR_RECENT_MS         = 7000;
+static const float         RADAR_MIN_CONF          = 0.70f;
+
+// Clear-to-GREEN debounce (number of consecutive NO-present radar updates required)
+static const uint8_t       RADAR_CLEAR_READINGS    = 5;
+
+// ---------------- Supabase (ENABLED) ----------------
+#define ENABLE_SUPABASE 1
+const char* WIFI_SSID    = "Enter_7C22";
+const char* WIFI_PASS    = "12345678";
+const char* SUPABASE_URL   = "https://yvvuviobqbxiabndmglt.supabase.co";
+const char* SUPABASE_KEY   = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl2dnV2aW9icWJ4aWFibmRtZ2x0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTc5NDA5NDgsImV4cCI6MjA3MzUxNjk0OH0._vnt94PnULoHLF0rWWbYZN1EFIjQq9IJzvNB6sij_bo";
+const char* SUPABASE_TABLE = "Health Status";
+
+// ---------------- RS485 ----------------
+HardwareSerial RS485(RS485_UART_NUM);
+String lineBuf;
+
+// ---------------- Statistics ----------------
+unsigned long totalRxMessages = 0;
+unsigned long totalTxMessages = 0;
+unsigned long totalParseErrors = 0;
+unsigned long lastStatsReport = 0;
+
+// ---------------- Data models ----------------
+struct Wearable {
+  int   hr=0, rr=0, sbp=0, dbp=0;
+  float temp=0.0f;
+  bool  act=false;
+  bool  emergency=false;
+  bool  fall=false;
+  bool  leadOff=false;
+  bool  leadSupported=false;
+  String device_mac="";
+  uint8_t hrCritCount=0, tempCritCount=0, leadOffCount=0;
+  uint8_t severity=0;          // 0=GREEN,1=YELLOW,2=RED(vitals/EMG),3=RED(FALL hold)
+  unsigned long lastUpdate=0, firstSeen=0, lastFallMs=0, lastPostMs=0, updates=0;
+  bool isFirstReading=true;
+};
+
+struct Radar {
+  bool present=false;
+  float dist_m=0.0f;
+  float speed_cmps=0.0f;
+  unsigned long lastUpdate=0, firstSeen=0, updates=0;
+  String mac="";
+  uint8_t fallStatus=0;   // 0=NORMAL,1=DETECTED,2=CONFIRMED,3=RECOVERY
+  float   fallConf=0.0f;
+  bool    fallValid=false;
+};
+
+std::map<int, Wearable> wearables;
+std::map<String, Radar> radars;
+
+// ---------------- Helpers ----------------
+static inline void allOff(){ digitalWrite(PIN_GREEN,LOW); digitalWrite(PIN_YELLOW,LOW); digitalWrite(PIN_RED,LOW); }
+static inline bool isHrCritical(int hr){ return (hr==0 || hr<50 || hr>140); }
+static inline bool isTempCritical(float t){ if(t==0.0f) return false; return (t<24.0f || t>42.0f); }
+static inline String trimVal(String s){ s.trim(); return s; }
+static String encodeTablePath(const char* n){ String s(n); s.replace(" ","%20"); return s; }
+
+// RS485 Direction Control Helper
+static void rs485SetDirection(bool transmit) {
+  digitalWrite(RS485_DIR_PIN, transmit ? HIGH : LOW);
+  if (transmit) {
+    delayMicroseconds(1000); // Setup time
+  } else {
+    delayMicroseconds(500);  // Hold time
+  }
+}
+
+// RS485 Send Helper (for heartbeat/debug responses)
+static bool rs485SendLine(const String& line) {
+  if (line.length() == 0) return false;
+  
+  // Clear RX buffer
+  while (RS485.available()) RS485.read();
+  
+  // Switch to TX mode
+  rs485SetDirection(true);
+  
+  // Send message
+  size_t written = RS485.print(line);
+  RS485.flush();
+  
+  // Switch back to RX mode
+  rs485SetDirection(false);
+  
+  totalTxMessages++;
+  Serial.printf("📡 RS485 TX: %s", line.c_str());
+  
+  return (written == line.length());
+}
+
+static bool radarSaysHumanPresentRecently(unsigned long nowMs){
+  for (auto &kv: radars){
+    const Radar& r = kv.second;
+    if (nowMs - r.lastUpdate <= RADAR_RECENT_MS && r.present) return true;
+  }
+  return false;
+}
+
+static bool radarConfirmsFallRecently(unsigned long nowMs){
+  for (auto &kv: radars){
+    const Radar& r = kv.second;
+    if (nowMs - r.lastUpdate <= RADAR_RECENT_MS && r.fallValid){
+      if (r.fallStatus==2) return true;
+      if (r.fallStatus==1 && r.fallConf>=RADAR_MIN_CONF) return true;
+    }
+  }
+  return false;
+}
+
+// -------------- Supabase: POST vitals for web --------------
+static void postVitalsToSupabase(int id, const Wearable& w){
+#if ENABLE_SUPABASE
+  if (WiFi.status()!=WL_CONNECTED){ 
+    Serial.println("🚫 WiFi disconnected (skip Supabase)."); 
+    return; 
+  }
+  
+  String endpoint = String(SUPABASE_URL)+"/rest/v1/"+encodeTablePath(SUPABASE_TABLE);
+
+  WiFiClientSecure client; 
+  client.setInsecure();
+  HTTPClient http;
+  
+  if (!http.begin(client, endpoint)){ 
+    Serial.println("❌ http.begin() failed"); 
+    return; 
+  }
+
+  http.addHeader("Content-Type","application/json");
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization","Bearer "+String(SUPABASE_KEY));
+  http.addHeader("Prefer","return=representation");
+  http.setTimeout(10000); // Increased timeout
+
+  // If a fall is detected, send "Fall detected". Otherwise, send "Active".
+  String bodyActivity = w.fall ? "Fall detected" : "Active";
+  StaticJsonDocument<512> doc; // Increased size
+  
+  if (w.device_mac.length()) doc["mac_address"]=w.device_mac;
+  doc["heart_rate"]=w.hr;
+  doc["temperature"]=w.temp;
+  doc["respiratory_rate"]=w.rr;
+  doc["blood_pressure"]=String(w.sbp)+"/"+String(w.dbp);
+  doc["body_activity"]=bodyActivity;
+  // NOTE: emergency_status, fall_detected, and lead_off fields have been removed
+  // to match the user-provided schema.
+
+  String payload; 
+  serializeJson(doc,payload);
+  
+  Serial.print("🌐 Supabase POST → "); Serial.println(payload);
+  
+  int code = http.POST(payload);
+  String resp = http.getString();
+  
+  Serial.printf("📥 Supabase response code: %d\n", code);
+  if (resp.length() > 0 && resp.length() < 200) { 
+    Serial.print("📥 Supabase body: "); Serial.println(resp); 
+  }
+  
+  if (code < 200 || code >= 300) {
+    Serial.printf("❌ Supabase error: %s\n", http.errorToString(code).c_str());
+  } else {
+    Serial.println("✅ Supabase OK");
+  }
+  
+  http.end();
+#endif
+}
+
+// ---------------- IMPROVED Parsing ----------------
+static void parseWearableLine(const String& line){
+  int id=-1, hr=0, rr=0, sbp=0, dbp=0; 
+  float temp=0.0f;
+  bool act=false, emergency=false, fall=false, lead=false, leadProvided=false;
+  String devMac="";
+
+  // More robust parsing
+  int start=0;
+  while (start < (int)line.length()){
+    int comma = line.indexOf(',', start); 
+    if (comma == -1) comma = line.length();
+    
+    String part = trimVal(line.substring(start, comma));
+    if (part.length() == 0) {
+      start = comma + 1;
+      continue;
+    }
+    
+    // Parse each field with better error handling
+    if (part.startsWith("ID:")) {
+      String val = trimVal(part.substring(3));
+      id = val.toInt();
+      if (id == 0 && val != "0") id = -1; // Invalid conversion
+    }
+    else if (part.startsWith("Sender:")) {
+      String val = trimVal(part.substring(7));
+      id = val.toInt();
+      if (id == 0 && val != "0") id = -1;
+    }
+    else if (part.startsWith("MAC:")) {
+      devMac = trimVal(part.substring(4));
+    }
+    else if (part.startsWith("HR:")) { 
+      String val = part.substring(3); 
+      val.replace("BPM",""); 
+      val.trim(); 
+      hr = val.toInt(); 
+    }
+    else if (part.startsWith("Temp:")) { 
+      String val = part.substring(5); 
+      val.replace("°C",""); 
+      val.replace("C",""); 
+      val.trim(); 
+      temp = val.toFloat(); 
+    }
+    else if (part.startsWith("RR:")) { 
+      String val = part.substring(3); 
+      val.replace("/min",""); 
+      val.trim(); 
+      rr = val.toInt(); 
+    }
+    else if (part.startsWith("BP:")) { 
+      String val = part.substring(3); 
+      val.replace("mmHg",""); 
+      val.trim(); 
+      int slash = val.indexOf('/'); 
+      if (slash > 0) { 
+        sbp = val.substring(0, slash).toInt(); 
+        dbp = val.substring(slash + 1).toInt(); 
+      } 
+    }
+    else if (part.startsWith("ACT:")) { 
+      String val = part.substring(4); 
+      val.trim(); 
+      val.toUpperCase();
+      act = (val == "MOTION" || val == "1" || val == "TRUE"); 
+    }
+    else if (part.startsWith("EMG:")) { 
+      String val = part.substring(4); 
+      val.trim(); 
+      emergency = (val.toInt() == 1); 
+    }
+    else if (part.startsWith("FALL:")) { 
+      String val = part.substring(5); 
+      val.trim(); 
+      fall = (val.toInt() == 1); 
+    }
+    else if (part.startsWith("LEAD:")) { 
+      String val = part.substring(5); 
+      val.trim(); 
+      lead = (val.toInt() == 1); 
+      leadProvided = true; 
+    }
+    
+    start = comma + 1;
+  }
+  
+  if (id < 0) { 
+    Serial.printf("⚠ Wearable line missing/invalid ID: %s\n", line.c_str()); 
+    totalParseErrors++;
+    return; 
+  }
+
+  Wearable &w = wearables[id];
+  const unsigned long now = millis();
+
+  if (w.updates == 0) { 
+    w = Wearable(); 
+    w.firstSeen = now; 
+    w.isFirstReading = true; 
+    w.severity = 0; 
+    Serial.printf("🆕 Wearable %d detected\n", id); 
+  } else { 
+    w.isFirstReading = false; 
+  }
+  w.updates++;
+
+  w.lastUpdate = now; 
+  w.hr = hr; 
+  w.temp = temp; 
+  w.rr = rr; 
+  w.sbp = sbp; 
+  w.dbp = dbp; 
+  w.act = act;
+  w.emergency = emergency; 
+  w.fall = fall;
+  
+  if (devMac.length()) w.device_mac = devMac;
+  if (leadProvided) { 
+    w.leadOff = lead; 
+    w.leadSupported = true; 
+  }
+
+  // Fast fall gate with radar support
+  if (fall) {
+    bool strongRadarFall = radarConfirmsFallRecently(now);
+    bool humanPresent = radarSaysHumanPresentRecently(now);
+    if (strongRadarFall || !humanPresent) {
+      w.lastFallMs = now;
+      Serial.printf("🛑 FALL ARMED for W%d (%s)\n", id, 
+                      strongRadarFall ? "radar strong fall" : "no radar presence");
+    } else {
+      Serial.printf("ℹ️  FALL IGNORED for W%d (radar presence & no strong fall)\n", id);
+    }
+  }
+
+  // Debounce vitals (skip on first reading)
+  bool hrCrit = isHrCritical(hr);
+  bool tempCrit = isTempCritical(temp);
+  
+  if (!w.isFirstReading) {
+    w.hrCritCount = hrCrit ? (uint8_t)min(255, (int)w.hrCritCount + 1) : 0;
+    w.tempCritCount = tempCrit ? (uint8_t)min(255, (int)w.tempCritCount + 1) : 0;
+  } else { 
+    w.hrCritCount = 0; 
+    w.tempCritCount = 0; 
+  }
+
+  if (w.leadSupported) {
+    w.leadOffCount = w.leadOff ? (uint8_t)min(255, (int)w.leadOffCount + 1) : 0;
+  }
+
+  // Severity selection
+  bool fallHoldActive = (w.lastFallMs > 0) && ((now - w.lastFallMs) < HOLD_FALL_MS);
+  uint8_t oldSev = w.severity;
+  
+  if (w.emergency) {
+    w.severity = 2;
+  } else if (fallHoldActive) {
+    w.severity = 3;
+  } else {
+    uint8_t thr = w.act ? CRIT_THRESH_MOTION : CRIT_THRESH_REST;
+    if (w.hrCritCount >= thr || w.tempCritCount >= thr) {
+      w.severity = 2;
+    } else {
+      w.severity = (w.updates > 0) ? 1 : 0;
+    }
+  }
+  
+  if (w.severity != oldSev) {
+    const char* severityNames[] = {"GREEN", "YELLOW", "RED(vitals/EMG)", "RED(FALL hold)"};
+    Serial.printf("📊 Wearable %d Severity %u→%s (EMG:%d, FALL:%d, HR:%d, Temp:%.1f)\n", 
+                  id, oldSev, severityNames[w.severity], w.emergency, w.fall, w.hr, w.temp);
+  }
+
+#if ENABLE_SUPABASE
+  if (now - w.lastPostMs >= POST_MIN_INTERVAL_MS) { 
+    postVitalsToSupabase(id, w); 
+    w.lastPostMs = now; 
+  }
+#endif
+}
+
+static void parseRadarLine(const String& line){
+  String mac=""; 
+  bool present=false; 
+  float dist=0, spd=0;
+  bool fallProvided=false, confProvided=false; 
+  uint8_t fallStatus=0; 
+  float fallConf=0.0f;
+
+  int start=0;
+  while (start < (int)line.length()) {
+    int comma = line.indexOf(',', start); 
+    if (comma == -1) comma = line.length();
+    
+    String part = trimVal(line.substring(start, comma));
+    if (part.length() == 0) {
+      start = comma + 1;
+      continue;
+    }
+
+    if (part.startsWith("RADAR:")) {
+      mac = trimVal(part.substring(6));
+    }
+    else if (part.startsWith("Present:")) { 
+      String val = trimVal(part.substring(8)); 
+      val.toUpperCase(); 
+      present = (val == "YES" || val == "1" || val == "TRUE" || val == "STRONG"); 
+    }
+    else if (part.startsWith("Dist:")) { 
+      String val = part.substring(5); 
+      val.replace("m",""); 
+      val.trim();  
+      dist = val.toFloat(); 
+    }
+    else if (part.startsWith("Speed:")) { 
+      String val = part.substring(6); 
+      val.replace("cm/s",""); 
+      val.replace("cmps",""); 
+      val.trim(); 
+      spd = val.toFloat(); 
+    }
+    else if (part.startsWith("FALL:")) { 
+      String val = trimVal(part.substring(5)); 
+      val.toUpperCase();
+      if (val == "DETECTED" || val == "1") fallStatus = 1;
+      else if (val == "CONFIRMED" || val == "2") fallStatus = 2;
+      else if (val == "RECOVERY" || val == "3") fallStatus = 3;
+      else fallStatus = 0; 
+      fallProvided = true; 
+    }
+    else if (part.startsWith("CONF:")) { 
+      String val = trimVal(part.substring(5)); 
+      fallConf = val.toFloat(); 
+      confProvided = true; 
+    }
+    
+    start = comma + 1;
+  }
+  
+  if (mac.length() == 0) { 
+    Serial.printf("⚠ Radar line missing MAC: %s\n", line.c_str()); 
+    totalParseErrors++;
+    return; 
+  }
+
+  Radar &r = radars[mac];
+  unsigned long now = millis();
+  
+  if (r.updates == 0) { 
+    r.firstSeen = now; 
+    r.mac = mac; 
+    Serial.printf("🆕 Radar %s detected\n", mac.c_str()); 
+  }
+  r.updates++;
+  
+  r.lastUpdate = now; 
+  r.present = present; 
+  r.dist_m = dist; 
+  r.speed_cmps = spd;
+  
+  if (fallProvided || confProvided) { 
+    r.fallStatus = fallStatus; 
+    r.fallConf = fallConf; 
+    r.fallValid = true; 
+  }
+
+  Serial.printf("📡 Radar %s -> Present:%s Dist:%.1fm Speed:%.1fcm/s", 
+                mac.c_str(), present ? "YES" : "NO", dist, spd);
+  if (r.fallValid) {
+    Serial.printf(" FALL:%u CONF:%.2f", r.fallStatus, r.fallConf);
+  }
+  Serial.println();
+}
+
+// Handle special messages
+static void parseSpecialLine(const String& line) {
+  if (line.startsWith("HEARTBEAT:")) {
+    Serial.printf("💓 Received: %s\n", line.c_str());
+    // Respond with our own heartbeat
+    rs485SendLine("HEARTBEAT:EXTERNAL_HUB:" + String(millis()) + "\n");
+  }
+  else if (line.startsWith("STARTUP:")) {
+    Serial.printf("🚀 Internal hub startup: %s\n", line.c_str());
+  }
+  else {
+    Serial.printf("⚠ Unknown special line: %s\n", line.c_str());
+  }
+}
+
+// ---------------- LED aggregator with radar-only arming + clear debounce --------------
+static void updateTowerLight(){
+  static unsigned long lastFastBlink = 0, lastSlowBlink = 0;
+  static bool fastOn = false, slowOn = false;
+
+  // Existing radar-only arming (for slow blink)
+  static uint32_t lastTotalRadarUpdates = 0;
+  static uint8_t  radarOnlyConsecCount  = 0;
+  static bool     radarOnlyArmed        = false;
+
+  // Clear-to-GREEN debounce state
+  static uint32_t lastTotalForClear = 0;
+  static uint8_t  radarNoPresenceConsec = 0;
+  static bool     radarClearedArmed = false;
+
+  const unsigned long now = millis();
+
+  // Cleanup stale devices
+  for (auto it = wearables.begin(); it != wearables.end(); ) {
+    if (now - it->second.lastUpdate > TIMEOUT_MS) { 
+      Serial.printf("⌛ Wearable %d timed out\n", it->first); 
+      it = wearables.erase(it); 
+    } else {
+      ++it;
+    }
+  }
+  
+  for (auto it = radars.begin(); it != radars.end(); ) {
+    if (now - it->second.lastUpdate > TIMEOUT_MS) { 
+      Serial.printf("⌛ Radar %s timed out\n", it->first.c_str()); 
+      it = radars.erase(it); 
+    } else {
+      ++it;
+    }
+  }
+
+  // Aggregate presence
+  uint8_t maxSev = 0;
+  bool anyWearable = !wearables.empty();
+  for (auto &kv: wearables) {
+    if (kv.second.severity > maxSev) maxSev = kv.second.severity;
+  }
+
+  bool anyRadarPresence = false;
+  for (auto &kv: radars) { 
+    if (kv.second.present) { 
+      anyRadarPresence = true; 
+      break; 
+    } 
+  }
+
+  const bool overallPresence = anyWearable || anyRadarPresence;
+  const bool radarOnly = (anyRadarPresence && !anyWearable);
+
+  // Lead-off warning only if not RED
+  bool leadWarning = false;
+  if (maxSev < 2) {
+    for (auto &kv: wearables) {
+      const Wearable &w = kv.second;
+      if (w.leadSupported && w.leadOffCount >= LEADOFF_WARN_COUNT) { 
+        leadWarning = true; 
+        break; 
+      }
+    }
+  }
+
+  // Radar-only arming (slow blink)
+  uint32_t totalRadarUpdates = 0;
+  for (auto &kv: radars) {
+    if (now - kv.second.lastUpdate <= TIMEOUT_MS) {
+      totalRadarUpdates += kv.second.updates;
+    }
+  }
+
+  if (totalRadarUpdates != lastTotalRadarUpdates) {
+    lastTotalRadarUpdates = totalRadarUpdates;
+    if (radarOnly) { 
+      if (radarOnlyConsecCount < 255) radarOnlyConsecCount++; 
+    } else { 
+      radarOnlyConsecCount = 0; 
+    }
+  }
+  radarOnlyArmed = (radarOnlyConsecCount >= RADAR_ONLY_ARM_READINGS);
+  if (!radarOnly) radarOnlyArmed = false;
+
+  // Clear-to-GREEN debounce (works only when there ARE radars)
+  if (totalRadarUpdates != lastTotalForClear) {
+    lastTotalForClear = totalRadarUpdates;
+    if (!radars.empty()) {
+      if (anyRadarPresence) {
+        radarNoPresenceConsec = 0;
+        radarClearedArmed = false;
+      } else {
+        if (radarNoPresenceConsec < 255) radarNoPresenceConsec++;
+        radarClearedArmed = (radarNoPresenceConsec >= RADAR_CLEAR_READINGS);
+      }
+    } else {
+      // no radars active -> allow normal GREEN behavior
+      radarNoPresenceConsec = 0;
+      radarClearedArmed = true;
+    }
+    
+    if (radarNoPresenceConsec > 0) {
+      Serial.printf("🧮 Clear-to-green: no-presence-consec=%u, armed=%d\n",
+                      radarNoPresenceConsec, radarClearedArmed);
+    }
+  }
+
+  // Blink timers
+  if (leadWarning && overallPresence && maxSev < 2) {
+    if (now - lastFastBlink >= BLINK_FAST_MS) { 
+      lastFastBlink = now; 
+      fastOn = !fastOn; 
+    }
+  } else {
+    fastOn = false;
+  }
+
+  if (radarOnlyArmed) {
+    if (now - lastSlowBlink >= BLINK_SLOW_MS) { 
+      lastSlowBlink = now; 
+      slowOn = !slowOn; 
+    }
+  } else {
+    slowOn = false;
+  }
+
+  // Drive LEDs (priority order)
+  allOff();
+
+  // Explicitly check for an emergency button press first
+  bool anyEmergency = false;
+  for (auto &kv: wearables) {
+    if (kv.second.emergency) {
+      anyEmergency = true;
+      break;
+    }
+  }
+
+  if (anyEmergency) {
+    // 1. HIGHEST PRIORITY: Emergency button press
+    digitalWrite(PIN_RED, HIGH);
+  } else if (leadWarning && anyWearable) {
+    // 2. SECOND PRIORITY: Lead-off warning (now ignores vitals/falls)
+    if (fastOn) digitalWrite(PIN_YELLOW, HIGH);
+  } else if (maxSev >= 2) {
+    // 3. THIRD PRIORITY: Other RED conditions (vitals, falls)
+    digitalWrite(PIN_RED, HIGH);
+  } else if (radarOnlyArmed) {
+    // YELLOW slow blink: Radar-only presence
+    if (slowOn) digitalWrite(PIN_YELLOW, HIGH);
+  } else if (anyWearable) {
+    // YELLOW solid: Normal presence (wearable only)
+    digitalWrite(PIN_YELLOW, HIGH);
+} else {
+    // GREEN: No presence is detected from an armband.
+    digitalWrite(PIN_GREEN, HIGH);
+  }
+}
+
+// Enhanced statistics
+static void printStats() {
+  unsigned long now = millis();
+  if (now - lastStatsReport < 20000) return; // Every 20 seconds
+  lastStatsReport = now;
+
+  int activeWear = 0, activeRad = 0, emgActive = 0;
+  for (auto &kv: wearables) {
+    if (now - kv.second.lastUpdate <= TIMEOUT_MS) {
+      activeWear++;
+      if (kv.second.emergency) emgActive++;
+    }
+  }
+  for (auto &kv: radars) {
+    if (now - kv.second.lastUpdate <= TIMEOUT_MS) activeRad++;
+  }
+
+  Serial.println("\n=== EXTERNAL HUB STATS ===");
+  Serial.printf("Uptime: %lus\n", now/1000);
+  Serial.printf("RS485 RX: %lu messages\n", totalRxMessages);
+  Serial.printf("RS485 TX: %lu messages\n", totalTxMessages);
+  Serial.printf("Parse errors: %lu\n", totalParseErrors);
+  Serial.printf("Active: %d wearables (%d EMG), %d radars\n", activeWear, emgActive, activeRad);
+  Serial.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+  Serial.printf("LED Status: G=%d Y=%d R=%d\n", 
+                digitalRead(PIN_GREEN), digitalRead(PIN_YELLOW), digitalRead(PIN_RED));
+  Serial.println("===============================\n");
+}
+
+// ---------------- Setup / Loop ----------------
+void setup(){
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("🚀 External Hub v2.0 starting...");
+
+  // Clear device maps
+  wearables.clear(); 
+  radars.clear();
+  
+  // Initialize statistics
+  totalRxMessages = 0;
+  totalTxMessages = 0;
+  totalParseErrors = 0;
+  lastStatsReport = millis();
+  
+  // Setup tower light pins
+  pinMode(PIN_GREEN, OUTPUT); 
+  pinMode(PIN_YELLOW, OUTPUT); 
+  pinMode(PIN_RED, OUTPUT);
+  allOff(); 
+  digitalWrite(PIN_GREEN, HIGH); // Start with GREEN
+
+  // Setup RS485 with direction control
+  pinMode(RS485_DIR_PIN, OUTPUT); 
+  rs485SetDirection(false); // Start in RX mode
+  
+  RS485.begin(9600, SERIAL_8N1, RS485_RXD, RS485_TXD);
+  RS485.setRxBufferSize(2048); // Increased buffer
+  RS485.setTxBufferSize(1024);
+  
+  Serial.printf("✅ RS485 ready (UART%d @9600 8N1, RX=%d, TX=%d, DIR=%d)\n",
+                RS485_UART_NUM, RS485_RXD, RS485_TXD, RS485_DIR_PIN);
+
+#if ENABLE_SUPABASE
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("🔌 WiFi connecting");
+  
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 20000) { 
+    delay(500); 
+    Serial.print("."); 
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n✅ WiFi connected. IP=%s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("\n⚠ WiFi connection failed (Supabase will be disabled)");
+  }
+#endif
+
+  Serial.println("✅ External Hub Ready. Listening for RS485 data…");
+  
+  // Send startup confirmation
+  delay(1000);
+  rs485SendLine("STARTUP:EXTERNAL_HUB:READY\n");
+}
+
+void loop(){
+  // Process RS485 incoming data
+  while (RS485.available()) {
+    char c = RS485.read();
+    
+    if (c == '\n' || c == '\r') {
+      lineBuf.trim();
+      if (lineBuf.length() > 0) {
+        totalRxMessages++;
+        Serial.printf("📡 RS485 RX: %s\n", lineBuf.c_str());
+        
+        // Route to appropriate parser
+        if (lineBuf.startsWith("ID:") || lineBuf.startsWith("Sender:")) {
+          parseWearableLine(lineBuf);
+        }
+        else if (lineBuf.startsWith("RADAR:")) {
+          parseRadarLine(lineBuf);
+        }
+        else if (lineBuf.startsWith("HEARTBEAT:") || lineBuf.startsWith("STARTUP:")) {
+          parseSpecialLine(lineBuf);
+        }
+        else {
+          Serial.printf("⚠ Unknown message format: %s\n", lineBuf.c_str());
+          totalParseErrors++;
+        }
+      }
+      lineBuf = "";
+    } 
+    else if (c >= 32 && c <= 126) { // Printable characters only
+      lineBuf += c;
+      if (lineBuf.length() > 500) { // Prevent buffer overflow
+        Serial.println("⚠ Line too long, clearing buffer");
+        lineBuf = "";
+        totalParseErrors++;
+      }
+    }
+    // Ignore other characters (control chars, etc.)
+  }
+
+  // Update tower light (rate limited)
+  static unsigned long lastLight = 0;
+  if (millis() - lastLight >= 100) { 
+    lastLight = millis(); 
+    updateTowerLight(); 
+  }
+  
+  // Print statistics
+  printStats();
+
+  // Small delay to prevent overwhelming
+  delay(10);
+}
