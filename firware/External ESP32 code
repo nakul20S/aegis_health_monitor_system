@@ -46,8 +46,8 @@ static const uint8_t       RADAR_CLEAR_READINGS    = 5;
 #define ENABLE_SUPABASE 1
 const char* WIFI_SSID    = "Enter_7C22";
 const char* WIFI_PASS    = "12345678";
-const char* SUPABASE_URL   = "https://yvvuviobqbxiabndmglt.supabase.co";
-const char* SUPABASE_KEY   = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl2dnV2aW9icWJ4aWFibmRtZ2x0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTc5NDA5NDgsImV4cCI6MjA3MzUxNjk0OH0._vnt94PnULoHLF0rWWbYZN1EFIjQq9IJzvNB6sij_bo";
+const char* SUPABASE_URL   = "https://xxxxxxxxxxxxxx.supabase.co";
+const char* SUPABASE_KEY   = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 const char* SUPABASE_TABLE = "Health Status";
 
 // ---------------- RS485 ----------------
