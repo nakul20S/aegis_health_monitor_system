@@ -1,0 +1,516 @@
+// ===== INTERNAL HUB (ESP-NOW → RS485 Bridge, FIXED) =====
+// - Fixed RS485 timing and direction control
+// - Added message pacing to prevent overwhelm
+// - Improved error handling and diagnostics
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_idf_version.h>
+#include <HardwareSerial.h>
+
+// Forward-declare struct tags
+struct WearableState;
+struct RadarState;
+
+// RS485 wiring - FIXED configuration
+#define RXD2        20      // RS485 RX (to MAX485 RO)
+#define TXD2        21      // RS485 TX (from MAX485 DI)
+#define RS485_DIR   7       // MAX485 DE/RE (HIGH=TX, LOW=RX)
+HardwareSerial RS485Serial(1);   // UART1
+
+// Timing - IMPROVED for better reliability
+static const unsigned long TIMEOUT_MS        = 500;
+static const unsigned long FORWARD_INTERVAL  = 10000;  // Increased from 5000
+static const unsigned long EMG_FORWARD_MS    = 1500;  // Increased from 1000
+static const unsigned long STATS_INTERVAL    = 30000;
+static const unsigned long MIN_MSG_SPACING   = 100;   // NEW: minimum time between messages
+
+// ESP-NOW payloads (unchanged)
+typedef struct __attribute__((packed)) {
+  uint8_t  user_id;
+  int      bpm;
+  float    temperature;
+  int      blood_pressure_sbp;
+  int      blood_pressure_dbp;
+  int      respiratory_rate;
+  int      activeness;
+  int      emergency;
+  int      fall_detected;
+  int      lead_off;
+  unsigned long timestamp;
+} HealthData41;
+
+typedef struct __attribute__((packed)) {
+  uint8_t  user_id;
+  int      bpm;
+  float    temperature;
+  int      blood_pressure_sbp;
+  int      blood_pressure_dbp;
+  int      respiratory_rate;
+  int      activeness;
+  int      emergency;
+  int      fall_detected;
+  unsigned long timestamp;
+} HealthData37;
+
+#pragma pack(push, 1)
+typedef struct {
+  uint8_t  present;
+  float    distance_m;
+  float    speed_cmps;
+  uint32_t ts_ms;
+} PresencePacket13;
+
+typedef struct {
+  uint8_t  present;
+  float    distance_m;
+  float    speed_cmps;
+  uint8_t  fallStatus;
+  float    fallConfidence;
+} PresencePacket14;
+
+typedef struct {
+  uint8_t  user_id;
+  uint8_t  emg;
+  uint32_t ts_ms;
+} EmgEvent;
+#pragma pack(pop)
+
+// Size assertions
+static_assert(sizeof(HealthData41)     == 41, "HealthData41 must be 41 bytes");
+static_assert(sizeof(HealthData37)     == 37, "HealthData37 must be 37 bytes");
+static_assert(sizeof(PresencePacket13) == 13, "PresencePacket13 must be 13 bytes");
+static_assert(sizeof(PresencePacket14) == 14, "PresencePacket14 must be 14 bytes");
+static_assert(sizeof(EmgEvent)         == 6,  "EmgEvent must be 6 bytes");
+
+// Message queue (unchanged)
+enum : uint8_t {
+  MT_NONE=0, MT_HEALTH41=41, MT_HEALTH37=37,
+  MT_PRESENCE13=13, MT_PRESENCE14=14, MT_EMG=6
+};
+
+struct Msg {
+  uint8_t  type;
+  uint8_t  len;
+  uint8_t  mac[6];
+  uint8_t  bytes[48];
+};
+
+static const uint8_t QSIZE = 16;
+volatile uint8_t qHead = 0, qTail = 0;
+Msg qBuf[QSIZE];
+
+#if defined(ESP_IDF_VERSION_MAJOR)
+  portMUX_TYPE qMux = portMUX_INITIALIZER_UNLOCKED;
+#else
+  portMUX_TYPE qMux = portMUX_INITIALIZER_UNLOCKED;
+#endif
+
+inline bool enqueueMsg(uint8_t type, const uint8_t* mac, const uint8_t* data, int len) {
+  if (len <= 0 || len > (int)sizeof(qBuf[0].bytes)) return false;
+  portENTER_CRITICAL(&qMux);
+  uint8_t next = (uint8_t)((qHead + 1) % QSIZE);
+  if (next == qTail) { portEXIT_CRITICAL(&qMux); return false; }
+  Msg& m = qBuf[qHead];
+  m.type = type;
+  m.len  = (uint8_t)len;
+  if (mac) memcpy(m.mac, mac, 6); else memset(m.mac, 0, 6);
+  memcpy(m.bytes, data, len);
+  qHead = next;
+  portEXIT_CRITICAL(&qMux);
+  return true;
+}
+
+inline bool dequeueMsg(Msg& out) {
+  bool ok = false;
+  portENTER_CRITICAL(&qMux);
+  if (qTail != qHead) {
+    out = qBuf[qTail];
+    qTail = (uint8_t)((qTail + 1) % QSIZE);
+    ok = true;
+  }
+  portEXIT_CRITICAL(&qMux);
+  return ok;
+}
+
+// Device state structures (unchanged)
+struct WearableState {
+  bool   seen          = false;
+  unsigned long firstSeen = 0;
+  uint8_t mac[6] = {0};
+  unsigned long lastUpdate = 0;
+  int    hr   = 0;
+  float  temp = 0.0f;
+  int    rr   = 0;
+  int    sbp  = 0;
+  int    dbp  = 0;
+  int    act  = 0;
+  int    emg  = 0;
+  int    fall = 0;
+  bool   leadSupported = false;
+  int    leadOff = -1;
+  unsigned long updates = 0;
+};
+
+struct RadarState {
+  bool   used = false;
+  uint8_t mac[6] = {0};
+  unsigned long firstSeen = 0;
+  unsigned long lastUpdate = 0;
+  uint8_t present = 0;
+  float   dist_m  = 0.0f;
+  float   spd_cmps= 0.0f;
+  uint32_t srcTs  = 0;
+  uint8_t fallStatus = 0;
+  float   fallConf   = 0.0f;
+  bool    fallValid  = false;
+  unsigned long updates = 0;
+};
+
+WearableState wearables[256];
+static const int MAX_RADARS = 16;
+RadarState radars[MAX_RADARS];
+
+// Utility functions (unchanged)
+static inline bool macEqual(const uint8_t* a, const uint8_t* b) {
+  for (int i=0;i<6;i++) if (a[i]!=b[i]) return false; return true;
+}
+
+static int findRadarIndex(const uint8_t mac[6]) {
+  for (int i=0;i<MAX_RADARS;i++) if (radars[i].used && macEqual(radars[i].mac, mac)) return i;
+  return -1;
+}
+
+static int getOrCreateRadarIndex(const uint8_t mac[6]) {
+  int idx = findRadarIndex(mac);
+  if (idx >= 0) return idx;
+  for (int i=0;i<MAX_RADARS;i++) {
+    if (!radars[i].used) {
+      radars[i].used = true;
+      memcpy(radars[i].mac, mac, 6);
+      radars[i].firstSeen = millis();
+      radars[i].updates = 0;
+      return i;
+    }
+  }
+  return -1;
+}
+
+static String macToString(const uint8_t* mac) {
+  char buf[18];
+  sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X",
+          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
+}
+
+static inline const char* fallStatusToStr(uint8_t s) {
+  switch (s) {
+    case 1: return "DETECTED";
+    case 2: return "CONFIRMED";
+    case 3: return "RECOVERY";
+    default: return "NORMAL";
+  }
+}
+
+// ESP-NOW RX callback (unchanged)
+#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
+void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  const uint8_t* src = info ? info->src_addr : nullptr;
+#else
+void onReceive(const uint8_t *src_mac, const uint8_t *data, int len) {
+  const uint8_t* src = src_mac;
+#endif
+  uint8_t type = MT_NONE;
+  if      (len == (int)sizeof(HealthData41))      type = MT_HEALTH41;
+  else if (len == (int)sizeof(HealthData37))      type = MT_HEALTH37;
+  else if (len == (int)sizeof(PresencePacket14))  type = MT_PRESENCE14;
+  else if (len == (int)sizeof(PresencePacket13))  type = MT_PRESENCE13;
+  else if (len == (int)sizeof(EmgEvent))          type = MT_EMG;
+
+  if (type != MT_NONE) {
+    enqueueMsg(type, src, data, len);
+  }
+}
+
+// IMPROVED RS485 send helper with better timing and error checking
+void rs485SendLine(const String& line) {
+  if (line.length() == 0) return;
+  
+  // Ensure we're not sending too frequently
+  static unsigned long lastSend = 0;
+  unsigned long now = millis();
+  if (now - lastSend < MIN_MSG_SPACING) {
+    delay(MIN_MSG_SPACING - (now - lastSend));
+  }
+  
+  // Clear any pending RX data before transmitting
+  while (RS485Serial.available()) {
+    RS485Serial.read();
+  }
+  
+  // Switch to TX mode
+  digitalWrite(RS485_DIR, HIGH);
+  delayMicroseconds(500);  // Increased setup time
+  
+  // Send the message
+  RS485Serial.print(line);
+  RS485Serial.flush();     // Wait for TX complete
+  
+  // Switch back to RX mode
+  delayMicroseconds(500);  // Increased hold time
+  digitalWrite(RS485_DIR, LOW);
+  
+  lastSend = millis();
+  
+  // Debug output
+  Serial.printf("📡 RS485 TX (%d bytes): %s", line.length(), line.c_str());
+}
+
+// Process message functions (unchanged)
+void processMsg(const Msg& m) {
+  const unsigned long now = millis();
+
+  if (m.type == MT_HEALTH41) {
+    HealthData41 h; memcpy(&h, m.bytes, sizeof(h));
+    WearableState& w = wearables[h.user_id];
+    if (!w.seen) { w.seen = true; w.firstSeen = now; memcpy(w.mac, m.mac, 6); Serial.printf("🆕 Wearable %u from %s\n", h.user_id, macToString(m.mac).c_str()); }
+    w.lastUpdate = now; w.updates++;
+    w.hr=h.bpm; w.temp=h.temperature; w.rr=h.respiratory_rate;
+    w.sbp=h.blood_pressure_sbp; w.dbp=h.blood_pressure_dbp;
+    w.act=h.activeness; w.emg=h.emergency; w.fall=h.fall_detected;
+    w.leadSupported=true; w.leadOff=h.lead_off;
+
+  } else if (m.type == MT_HEALTH37) {
+    HealthData37 h; memcpy(&h, m.bytes, sizeof(h));
+    WearableState& w = wearables[h.user_id];
+    if (!w.seen) { w.seen = true; w.firstSeen = now; memcpy(w.mac, m.mac, 6); Serial.printf("🆕 Wearable %u from %s\n", h.user_id, macToString(m.mac).c_str()); }
+    w.lastUpdate = now; w.updates++;
+    w.hr=h.bpm; w.temp=h.temperature; w.rr=h.respiratory_rate;
+    w.sbp=h.blood_pressure_sbp; w.dbp=h.blood_pressure_dbp;
+    w.act=h.activeness; w.emg=h.emergency; w.fall=h.fall_detected;
+    w.leadSupported=false; w.leadOff=-1;
+
+  } else if (m.type == MT_EMG) {
+    EmgEvent e; memcpy(&e, m.bytes, sizeof(e));
+    WearableState& w = wearables[e.user_id];
+    if (!w.seen) { w.seen = true; w.firstSeen = now; memcpy(w.mac, m.mac, 6); Serial.printf("🆕 Wearable %u (EMG-first) from %s\n", e.user_id, macToString(m.mac).c_str()); }
+    w.lastUpdate = now; w.updates++;
+    w.emg = (int)e.emg;
+
+  } else if (m.type == MT_PRESENCE14 || m.type == MT_PRESENCE13) {
+    int idx = getOrCreateRadarIndex(m.mac);
+    if (idx >= 0) {
+      RadarState& r = radars[idx];
+      if (r.updates == 0) { r.firstSeen = now; Serial.printf("🆕 Radar from %s\n", macToString(m.mac).c_str()); }
+      r.updates++; r.lastUpdate = now;
+
+      if (m.type == MT_PRESENCE14) {
+        PresencePacket14 p; memcpy(&p, m.bytes, sizeof(p));
+        r.present   = p.present;
+        r.dist_m    = p.distance_m;
+        r.spd_cmps  = p.speed_cmps;
+        r.fallStatus= p.fallStatus;
+        r.fallConf  = p.fallConfidence;
+        r.fallValid = true;
+      } else {
+        PresencePacket13 p; memcpy(&p, m.bytes, sizeof(p));
+        r.present   = p.present;
+        r.dist_m    = p.distance_m;
+        r.spd_cmps  = p.speed_cmps;
+        r.srcTs     = p.ts_ms;
+      }
+    }
+  }
+}
+
+// Line builders (unchanged)
+static String buildWearableLine(uint8_t id, const WearableState& w){
+  String line;
+  line.reserve(220);
+  line  = "ID:" + String(id)
+       +  ", MAC:" + macToString(w.mac)
+       +  ", HR:"   + String(w.hr) + "BPM"
+       +  ", Temp:" + String(w.temp, 1) + "C"
+       +  ", RR:"   + String(w.rr) + "/min"
+       +  ", BP:"   + String(w.sbp) + "/" + String(w.dbp) + "mmHg"
+       +  ", ACT:"  + String(w.act ? "MOTION" : "REST")
+       +  ", EMG:"  + String(w.emg)
+       +  ", FALL:" + String(w.fall);
+  if (w.leadSupported) line += ", LEAD:" + String(w.leadOff);
+  line += "\n";
+  return line;
+}
+
+static String buildRadarLine(const RadarState& r){
+  String line;
+  line.reserve(160);
+  const char* presentStr = r.present ? (r.present==2 ? "STRONG" : "YES") : "NO";
+  line  = "RADAR:" + macToString(r.mac)
+       +  ", Present:" + String(presentStr)
+       +  ", Dist:" + String(r.dist_m, 1) + "m"
+       +  ", Speed:" + String(r.spd_cmps, 1) + "cm/s";
+  if (r.fallValid) {
+    line += ", FALL:"; line += fallStatusToStr(r.fallStatus);
+    line += ", CONF:"; line += String(r.fallConf, 2);
+  }
+  line += "\n";
+  return line;
+}
+
+// IMPROVED periodic forwarding with better pacing
+unsigned long lastWearableFwd[256] = {0};
+unsigned long lastEmgFwd[256]      = {0};
+unsigned long lastRadarFwd         = 0;
+
+void forwardWearablesRegular() {
+  const unsigned long now = millis();
+  for (int id=0; id<256; id++) {
+    WearableState& w = wearables[id];
+    if (!w.seen) continue;
+    if (now - w.lastUpdate > TIMEOUT_MS) continue;
+
+    if (now - lastWearableFwd[id] >= FORWARD_INTERVAL) {
+      lastWearableFwd[id] = now;
+      String line = buildWearableLine(id, w);
+      Serial.print("📡 RS485 → "); Serial.print(line);
+      rs485SendLine(line);
+      delay(100); // Increased spacing between messages
+    }
+  }
+}
+
+void forwardWearablesEmgFast() {
+  const unsigned long now = millis();
+  for (int id=0; id<256; id++) {
+    WearableState& w = wearables[id];
+    if (!w.seen) continue;
+    if (now - w.lastUpdate > TIMEOUT_MS) continue;
+    if (w.emg != 1) continue;
+
+    if (now - lastEmgFwd[id] >= EMG_FORWARD_MS) {
+      lastEmgFwd[id] = now;
+      String line = buildWearableLine(id, w);
+      Serial.print("⚡ RS485 (EMG) → "); Serial.print(line);
+      rs485SendLine(line);
+      delay(50);
+    }
+  }
+}
+
+void forwardRadars() {
+  const unsigned long now = millis();
+  if (now - lastRadarFwd < FORWARD_INTERVAL) return;
+  lastRadarFwd = now;
+
+  for (int i=0;i<MAX_RADARS;i++) {
+    RadarState& r = radars[i];
+    if (!r.used) continue;
+    if (now - r.lastUpdate > TIMEOUT_MS) continue;
+
+    String line = buildRadarLine(r);
+    Serial.print("📡 RS485 → "); Serial.print(line);
+    rs485SendLine(line);
+    delay(50); // Spacing between radar messages
+  }
+}
+
+// Stats function (unchanged)
+void printStats() {
+  static unsigned long last = 0;
+  unsigned long now = millis();
+  if (now - last < STATS_INTERVAL) return;
+  last = now;
+
+  int activeWear = 0, activeRad = 0, emgActive = 0;
+  for (int id=0; id<256; id++) {
+    WearableState& w = wearables[id];
+    if (w.seen && (now - w.lastUpdate <= TIMEOUT_MS)) {
+      activeWear++;
+      if (w.emg == 1) emgActive++;
+    }
+  }
+  for (int i=0;i<MAX_RADARS;i++)
+    if (radars[i].used && (now - radars[i].lastUpdate <= TIMEOUT_MS)) activeRad++;
+
+  Serial.println("\n=== INTERNAL HUB STATS ===");
+  Serial.printf("Uptime: %lus\n", now/1000);
+  Serial.printf("Active: %d wearables (%d EMG), %d radars\n", activeWear, emgActive, activeRad);
+  Serial.printf("RS485 Status: %s\n", RS485Serial ? "Connected" : "Disconnected");
+  Serial.println("==========================\n");
+}
+
+// IMPROVED Setup
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("🚀 Internal Hub (ESP-NOW → RS485 Bridge) starting...");
+
+  WiFi.mode(WIFI_STA);
+  Serial.printf("📍 HUB MAC: %s\n", WiFi.macAddress().c_str());
+
+  // RS485 Setup with improved initialization
+  Serial.println("🔧 Initializing RS485...");
+  
+  // Configure direction pin first
+  pinMode(RS485_DIR, OUTPUT);
+  digitalWrite(RS485_DIR, LOW);  // Start in RX mode
+  
+  // Initialize UART
+  RS485Serial.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  
+  // Flush any existing data
+  delay(100);
+  while (RS485Serial.available()) {
+    RS485Serial.read();
+  }
+  
+  Serial.println("✅ RS485 initialized (UART1 @9600 8N1, RX=20, TX=21, DE/RE=7)");
+
+  // ESP-NOW Setup
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("❌ ESP-NOW init failed!");
+    while (true) { delay(1000); }
+  }
+  esp_now_register_recv_cb(onReceive);
+  Serial.println("✅ ESP-NOW ready (Health 41/37 + Presence 13/14 + EMG)");
+
+  // Send initial test message
+  delay(1000);
+  rs485SendLine("INTERNAL_HUB_READY\n");
+  
+  printStats();
+}
+
+// IMPROVED main loop with better timing
+void loop() {
+  static unsigned long lastLoop = 0;
+  unsigned long now = millis();
+  
+  // Process messages from queue (limit processing rate)
+  int processed = 0;
+  Msg m;
+  while (dequeueMsg(m) && processed < 5) { // Limit to 5 messages per loop
+    processMsg(m);
+    processed++;
+  }
+
+  // Forwarders (run at different intervals to spread load)
+  if (now - lastLoop >= 100) { // Run every 100ms
+    static uint8_t cycleCount = 0;
+    
+    switch (cycleCount % 3) {
+      case 0: forwardWearablesRegular(); break;
+      case 1: forwardWearablesEmgFast(); break;
+      case 2: forwardRadars(); break;
+    }
+    
+    cycleCount++;
+    lastLoop = now;
+  }
+
+  // Stats
+  printStats();
+
+  delay(20); // Increased yield time
+}
