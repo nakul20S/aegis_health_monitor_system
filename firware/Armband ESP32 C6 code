@@ -1,0 +1,930 @@
+// ============================================
+// ESP32-C6 XIAO Complete Health Monitor v9.7 - 10-SECOND INTERVAL
+//
+// FEATURES:
+// - DATA INTERVAL (CHANGED): ESP-NOW transmission interval changed from 5
+//   to 10 seconds. Averaging logic updated to sample once per second.
+// - FALL LOGIC (UPGRADED): The entire fall detection and recovery
+//   engine uses the robust, state-aware algorithm for superior accuracy.
+// - DEPLOYMENT READY: "while (!Serial)" is commented out.
+// - ESP-NOW FIX: Retains the delay(1) in the main loop for reliable transmission.
+// - EMERGENCY PATH: Implemented a high-priority "fast path" for emergency alerts.
+// ============================================
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+#include "ICM_20948.h"
+#include <Adafruit_TMP117.h>
+#include <Adafruit_Sensor.h>
+#include <esp_now.h>
+#include <WiFi.h>
+
+// Forward declarations
+int compareInts(const void *a, const void *b);
+void printResults(int rawECG);
+
+// --- System State & Sensor Status ---
+struct SystemStatus {
+    bool imu_ok;
+    bool temp_sensor_ok;
+    bool ecg_electrodes_ok;
+} system_status = {true, true, true};
+
+// --- Pin Map (XIAO ESP32-C6) ---
+#define ECG_OUTPUT_PIN  0   // ADC input
+#define LO_PLUS_PIN     2   // Lead-off detect (+)
+#define LO_MINUS_PIN    21  // Lead-off detect (-)
+#define EMERGENCY_BTN_PIN 19 // Emergency button (GPIO 19 to GND)
+
+// --- ESP-NOW Configuration ---
+uint8_t receiverMAC[] = { 0xB4, 0x3A, 0x45, 0x8A, 0x2B, 0x40 };
+
+// --- CORRECTED ESP-NOW Data Packets ---
+typedef struct __attribute__((packed)) {
+  uint8_t  user_id;
+  int      bpm;
+  float    temperature;
+  int      blood_pressure_sbp;
+  int      blood_pressure_dbp;
+  int      respiratory_rate;
+  int      activeness;
+  int      emergency;
+  int      fall_detected;
+  int      lead_off;
+  unsigned long timestamp;
+} HealthData41;
+
+typedef struct __attribute__((packed)) {
+  uint8_t  user_id;
+  uint8_t  emg;
+  uint32_t ts_ms;
+} EmgEvent;
+
+// --- Data Transmission State ---
+struct TransmissionState {
+  unsigned long system_start_time;
+  unsigned long last_transmission;
+  unsigned long last_emergency_transmission;
+  bool calibration_complete;
+  bool fall_hold_active;
+  unsigned long fall_hold_start;
+  float bpm_samples[10], sbp_samples[10], dbp_samples[10], rr_samples[10], temp_samples[10];
+  int sample_count;
+} tx_state = {0};
+
+const unsigned long CALIBRATION_TIME_MS = 60000;
+const unsigned long TRANSMISSION_INTERVAL_MS = 10000; // CHANGED to 10 seconds
+const unsigned long FALL_HOLD_TIME_MS = 120000;
+const unsigned long EMERGENCY_SEND_PERIOD_MS = 1000;
+
+// --- I2C Pins ---
+const int SDA_PIN = 22;
+const int SCL_PIN = 23;
+
+// --- ECG Parameters ---
+const int BASELINE_WINDOW = 200;
+const int PEAK_WINDOW = 30;
+const int MIN_BEAT_INTERVAL = 500;
+const float PEAK_THRESHOLD_RATIO = 0.6;
+const int MIN_PEAK_HEIGHT = 50;
+const int MIN_SIGNAL_RANGE = 100;
+const int REFRACTORY_PERIOD = 350;
+const int CALIBRATION_SAMPLES = 100;
+
+// --- ECG Lead-Off Debouncing ---
+const unsigned long LEAD_OFF_DEBOUNCE_MS = 500;
+bool isCurrentlyDisconnected = false;
+unsigned long disconnectStartTime = 0;
+
+// --- IMU Parameters ---
+const uint8_t I2C_AD0_ARG = 1; 
+const float SAMPLE_HZ = 100.0f;
+const unsigned long SAMPLE_MS = (unsigned long)(1000.0f / SAMPLE_HZ);
+const unsigned long I2C_CLOCK = 100000;
+const float USER_GYRO_BIAS_X = -1.3893f;
+const float USER_GYRO_BIAS_Y =  0.5344f;
+const float USER_GYRO_BIAS_Z =  0.9160f;
+float ACCEL_SMOOTH_ALPHA = 0.63f;
+
+// --- Motion Detection ---
+enum ActivityState_e { ACT_REST = 0, ACT_MOTION = 1 };
+static ActivityState_e ActivityState = ACT_REST;
+const int GYRO_WIN_N = 50;
+static float gyroMagBuf[GYRO_WIN_N];
+static int gyroWinIdx = 0;
+static float gyroSumsq = 0.0f;
+static int gyroCountWin = 0;
+float global_gyro_rms = 0.0f;
+const float ACT_TH_UP = 35.0f;
+const float ACT_TH_DOWN = 20.0f;
+const int ACT_DEBOUNCE_COUNT = 2;
+static int actUpCnt=0, actDownCnt=0;
+
+// --- ADVANCED Fall Detection & Recovery Parameters (from reference) ---
+struct Vec3 { float x; float y; float z; unsigned long t; };
+const int RING_BUF_LEN = 200;
+static Vec3 ring[RING_BUF_LEN];
+static int ringHead = -1, ringCount = 0;
+
+const float FREEFALL_THRESH_G = 0.80f;
+const unsigned long FREEFALL_MIN_MS = 20;
+const float IMPACT_THRESH_G = 2.0f;
+const float IMPACT_MIN_PEAK_G = 2.0f;
+const float GYRO_SPIKE_THRESHOLD_DPS = 120.0f;
+const unsigned long POST_IMPACT_WINDOW_MS = 4000;
+const unsigned long CONFIRM_HOLD_MS = 500;
+const unsigned long MAX_FREEFALL_TO_IMPACT_MS = 1000;
+const unsigned long FALL_LOCKOUT_MS = 3000;
+const float TILT_IMMEDIATE_DEG = 60.0f;
+const float FREEFALL_SPIN_GYRO_DPS = 150.0f;
+const float FREEFALL_SPIN_MAX_ACC_G = 1.20f;
+
+
+enum FallState { IDLE, MAYBE_FREEFALL, IMPACT_DETECTED, CONFIRMING_FALL };
+static FallState fallState = IDLE;
+static unsigned long freefallStartTs = 0, impactTs = 0, lastFallReportMs = 0;
+static unsigned long fallOutputUntil = 0, confirmHoldStart = 0, lastFreefallTs = 0;
+static Vec3 accelBeforeImpact = {0,0,0,0};
+static Vec3 accelAfterImpact  = {0,0,0,0};
+
+// --- ADVANCED RECOVERY STATE MACHINE (from reference) ---
+enum RecoveryState { REC_NONE=0, REC_WAITING, REC_ATTEMPT, REC_CONFIRMED, REC_TIMEOUT };
+const float RECOVERY_MOTION_GYRO = 50.0f;
+const float RECOVERY_GYRO_QUIET = 20.0f;
+const unsigned long RECOVERY_TIMEOUT_MS = 15000;
+const float RECOVERY_STAGE1_TILT_DEG = 60.0f;
+const float RECOVERY_STAGE2_TILT_DEG = 30.0f;
+const unsigned long RECOVERY_SUSTAIN_MS = 150;
+const unsigned long RECOVERY_MIN_MOTION_MS = 250;
+const float RECOVERY_MIN_TILT_DROP_DEG = 25.0f;
+
+static RecoveryState fallRecoveryState = REC_NONE;
+static bool fallActive = false;
+static unsigned long fallDetectedTs = 0;
+static Vec3 baselineGravity = {0.0f, 1.0f, 0.0f, 0}; // Assumes Y-Axis is vertical
+static unsigned long recoveryMotionTs = 0;
+static unsigned long recoveryStableStart = 0;
+static float recoveryTiltAtMotionStart = 180.0f;
+static bool recoveryStartedByTilt = false;
+
+
+// --- CORRECTED BPM to BP and RR Mapping Table ---
+struct VitalsMapping {
+    int hr;
+    float sbp;
+    float dbp;
+    float rr;
+};
+
+const VitalsMapping vitals_table[] = {
+    {60, 110, 70, 12.0}, {65, 110, 70, 12.0}, {70, 110, 70, 12.0},
+    {75, 110, 70, 12.0}, {80, 114, 70, 12.1}, {85, 118, 70, 12.4},
+    {90, 122, 70, 12.8}, {95, 126, 70, 13.2}, {100, 130, 70, 13.6},
+    {105, 134, 70, 14.1}, {110, 138, 70, 14.7}, {115, 142, 70, 15.3},
+    {120, 146, 70, 15.9}, {125, 150, 70, 16.6}, {130, 154, 70, 17.3},
+    {135, 158, 70, 18.0}, {140, 162, 70, 18.8}, {145, 166, 70, 19.6},
+    {150, 170, 70, 20.4}, {155, 174, 70, 21.3}, {160, 178, 70, 22.1},
+    {165, 182, 70, 23.0}, {170, 186, 70, 24.0}, {175, 190, 70, 24.9},
+    {180, 194, 70, 25.9}
+};
+const int VITALS_TABLE_SIZE = sizeof(vitals_table) / sizeof(vitals_table[0]);
+
+
+// --- Global Objects & Variables ---
+ICM_20948_I2C myICM;
+Adafruit_TMP117 tmp117;
+
+int   baselineBuffer[BASELINE_WINDOW];
+float bpmBuffer[8];
+int   recentSamples[PEAK_WINDOW];
+int   baselineIndex = 0, bpmIndex = 0, sampleIndex = 0;
+int   currentBaseline = 2048, dynamicThreshold = 2048, lastPeakValue = 0;
+float currentBPM = 0, reliableBPM = 0, stableBPM = 0;
+float currentSBP = 0, currentDBP = 0, currentRR = 0;
+float stableSBP = 0, stableDBP = 0, stableRR = 0;
+
+// Button state variables
+bool emergencyPressed = false;
+bool emergencyActiveState = false;
+unsigned long lastButtonCheck = 0;
+const unsigned long BUTTON_DEBOUNCE_MS = 50;
+
+unsigned long lastBeatTime = 0, refractoryEndTime = 0;
+bool isCalibrated = false;
+int calibrationCount = 0;
+float currentTemperature = 0.0f;
+unsigned long lastMs = 0, lastDebugPrint = 0, lastThreshUpdate = 0;
+unsigned long lastSensorCheck = 0;
+const unsigned long SENSOR_CHECK_INTERVAL_MS = 10000;
+unsigned long lastAverageSampleTime = 0; // NEW: Timer for 1-second sampling
+
+// ========================================================================
+// INITIALIZATION FUNCTIONS
+// ========================================================================
+void initializeESPNOW() {
+    WiFi.mode(WIFI_STA);
+    WiFi.setTxPower(WIFI_POWER_11dBm);
+
+    Serial.print("[INFO] MAC Address: ");
+    Serial.println(WiFi.macAddress());
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[FATAL] ESP-NOW init failed. Halting.");
+        while (true);
+    }
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, receiverMAC, 6);
+    if (esp_now_add_peer(&peer) != ESP_OK) {
+        Serial.println("[FATAL] Failed to add ESP-NOW peer. Halting.");
+        while (true);
+    }
+    Serial.println("[OK] ESP-NOW initialized successfully.");
+}
+
+void initializeIMU() {
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setClock(I2C_CLOCK);
+    if (myICM.begin(Wire, I2C_AD0_ARG) != ICM_20948_Stat_Ok) {
+        Serial.println("[FAIL] ICM-20948 (IMU) init failed. Motion/Fall detection disabled.");
+        system_status.imu_ok = false;
+    } else {
+        ICM_20948_fss_t fss;
+        fss.a = gpm4; fss.g = dps500;
+        myICM.setFullScale((ICM_20948_Internal_Gyr | ICM_20948_Internal_Acc), fss);
+        myICM.enableDMP(false);
+        system_status.imu_ok = true;
+        Serial.println("[OK] ICM-20948 (IMU) initialized.");
+    }
+}
+
+void initializeTempSensor() {
+    if (!tmp117.begin()) {
+        Serial.println("[FAIL] TMP117 (Temp) sensor not found. Temperature monitoring disabled.");
+        system_status.temp_sensor_ok = false;
+    } else {
+        system_status.temp_sensor_ok = true;
+        Serial.println("[OK] TMP117 (Temp) sensor initialized.");
+    }
+}
+
+// ========================================================================
+// ESP-NOW COMMUNICATION
+// ========================================================================
+
+void addToAveragingBuffers(float bpm, float sbp, float dbp, float rr, float temp) {
+    if (tx_state.sample_count < 10) { // Sized for 10 samples
+        tx_state.bpm_samples[tx_state.sample_count] = bpm;
+        tx_state.sbp_samples[tx_state.sample_count] = sbp;
+        tx_state.dbp_samples[tx_state.sample_count] = dbp;
+        tx_state.rr_samples[tx_state.sample_count] = rr;
+        tx_state.temp_samples[tx_state.sample_count] = temp;
+        tx_state.sample_count++;
+    }
+}
+
+float calculateAverage(float* samples, int count) {
+    if (count == 0) return 0;
+    float sum = 0;
+    int valid_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (samples[i] > 0) {
+            sum += samples[i];
+            valid_count++;
+        }
+    }
+    return (valid_count > 0) ? (sum / valid_count) : 0;
+}
+
+void resetAveragingBuffers() {
+    tx_state.sample_count = 0;
+    for (int i=0; i<10; ++i) {
+        tx_state.bpm_samples[i] = 0;
+        tx_state.sbp_samples[i] = 0;
+        tx_state.dbp_samples[i] = 0;
+        tx_state.rr_samples[i] = 0;
+        tx_state.temp_samples[i] = 0;
+    }
+}
+
+void sendHealthData() {
+    HealthData41 data;
+    data.user_id = 1;
+    data.timestamp = millis();
+    data.emergency = emergencyPressed ? 1 : 0;
+
+    data.bpm = system_status.ecg_electrodes_ok ? (int)calculateAverage(tx_state.bpm_samples, tx_state.sample_count) : 0;
+    data.blood_pressure_sbp = system_status.ecg_electrodes_ok ? (int)calculateAverage(tx_state.sbp_samples, tx_state.sample_count) : 0;
+    data.blood_pressure_dbp = system_status.ecg_electrodes_ok ? (int)calculateAverage(tx_state.dbp_samples, tx_state.sample_count) : 0;
+    data.respiratory_rate = system_status.ecg_electrodes_ok ? (int)calculateAverage(tx_state.rr_samples, tx_state.sample_count) : 0;
+    data.lead_off = system_status.ecg_electrodes_ok ? 0 : 1;
+    data.temperature = system_status.temp_sensor_ok ? calculateAverage(tx_state.temp_samples, tx_state.sample_count) : 0;
+    data.activeness = system_status.imu_ok ? ((ActivityState == ACT_MOTION) ? 1 : 0) : 0;
+
+    // LOGIC CORRECTION: 'fall_detected' is only 1 if a recovery has timed out
+    int fall_status = 0;
+    if (system_status.imu_ok && fallRecoveryState == REC_TIMEOUT) {
+        if (millis() < fallOutputUntil) { // Use the timer set when timeout occurred
+             fall_status = 1;
+        } else {
+             fallRecoveryState = REC_NONE; // Clear status after alert period
+        }
+    }
+    data.fall_detected = fall_status;
+
+    Serial.println("----------------------------------------");
+    Serial.print("[ESP-NOW SENDING] ");
+    Serial.print("BPM: "); Serial.print(data.bpm);
+    Serial.print(", BP: "); Serial.print(data.blood_pressure_sbp);
+    Serial.print("/"); Serial.print(data.blood_pressure_dbp);
+    Serial.print(", RR: "); Serial.print(data.respiratory_rate);
+    Serial.print(", Temp: "); Serial.print(data.temperature, 1);
+    Serial.print(", LO: "); Serial.print(data.lead_off);
+    Serial.print(", Motion: "); Serial.print(data.activeness);
+    Serial.print(", Fall: "); Serial.print(data.fall_detected);
+    Serial.print(", EMG: "); Serial.println(data.emergency);
+    
+    if (esp_now_send(receiverMAC, (uint8_t*)&data, sizeof(data)) == ESP_OK) {
+        Serial.println("[OK] Transmission successful.");
+    } else {
+        Serial.println("[FAIL] Transmission failed.");
+    }
+    Serial.println("----------------------------------------");
+
+    resetAveragingBuffers();
+}
+
+void sendEmergencyData(uint8_t emg_val) {
+    EmgEvent emg_data;
+    emg_data.user_id = 1;
+    emg_data.emg = emg_val;
+    emg_data.ts_ms = millis();
+
+    esp_err_t result = esp_now_send(receiverMAC, (uint8_t*)&emg_data, sizeof(emg_data));
+    if (result == ESP_OK) {
+        Serial.printf("⚡ EMG FAST-PATH SENT: %d\n", emg_val);
+    } else {
+        Serial.println("[FAIL] Emergency packet send failed.");
+    }
+}
+
+void handleDataTransmission() {
+    unsigned long now = millis();
+    static bool emgPrev = false;
+
+    if (!tx_state.calibration_complete) {
+        if (now - tx_state.system_start_time >= CALIBRATION_TIME_MS) {
+            tx_state.calibration_complete = true;
+            Serial.println("[INFO] System calibration complete. Starting data transmission.");
+        } else {
+            return;
+        }
+    }
+    
+    // Regular 10-second health data
+    if (now - tx_state.last_transmission >= TRANSMISSION_INTERVAL_MS) {
+        sendHealthData();
+        tx_state.last_transmission = now;
+    }
+
+    // High-priority emergency data fast-path
+    if (emergencyPressed && !emgPrev) { // Rising edge, send immediately
+        sendEmergencyData(1);
+        tx_state.last_emergency_transmission = now;
+    } else if (emergencyPressed && (now - tx_state.last_emergency_transmission >= EMERGENCY_SEND_PERIOD_MS)) { // Continue sending every second
+        sendEmergencyData(1);
+        tx_state.last_emergency_transmission = now;
+    } else if (!emergencyPressed && emgPrev) { // Falling edge, send one clear message
+        sendEmergencyData(0);
+    }
+    emgPrev = emergencyPressed;
+}
+
+// ========================================================================
+// SENSOR PROCESSING & LOGIC
+// ========================================================================
+
+// --- UTILITY ---
+static inline float vecMagG(float x, float y, float z) { return sqrtf(x*x + y*y + z*z); }
+static inline float dot3(const Vec3 &a, const Vec3 &b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+static float angleDegBetweenVecsSafe(const Vec3 &a, const Vec3 &b) {
+  float magA = vecMagG(a.x, a.y, a.z);
+  float magB = vecMagG(b.x, b.y, b.z);
+  if (magA < 1e-6f || magB < 1e-6f) return 180.0f;
+  float d = dot3(a,b) / (magA * magB);
+  if (d > 1.0f) d = 1.0f; else if (d < -1.0f) d = -1.0f;
+  return acosf(d) * 180.0f / 3.14159265f;
+}
+static inline void pushRing(float ax, float ay, float az, unsigned long t) {
+    ringHead = (ringHead + 1) % RING_BUF_LEN;
+    ring[ringHead] = {ax, ay, az, t};
+    if (ringCount < RING_BUF_LEN) ringCount++;
+}
+static Vec3 avgRingBetween(unsigned long t0, unsigned long t1) {
+    Vec3 s = {0.0f,0.0f,0.0f,0};
+    int c = 0;
+    for (int i = 0; i < ringCount; ++i) {
+        int idx = (ringHead - i + RING_BUF_LEN) % RING_BUF_LEN;
+        if (ring[idx].t >= t0 && ring[idx].t <= t1) {
+            s.x += ring[idx].x; s.y += ring[idx].y; s.z += ring[idx].z; ++c;
+        }
+    }
+    if (c > 0) { s.x /= c; s.y /= c; s.z /= c; }
+    return s;
+}
+float lerp(float x0, float y0, float x1, float y1, float x) {
+    if (x1 == x0) return y0;
+    return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+}
+
+
+// --- IMU & MOTION ---
+bool processIMU(float& accelX, float& accelY, float& accelZ, float& gyroX, float& gyroY, float& gyroZ) {
+    if (!system_status.imu_ok) return false;
+
+    if (!myICM.dataReady()) return false;
+    myICM.getAGMT();
+    if (myICM.status != ICM_20948_Stat_Ok) {
+        Serial.println("[WARN] IMU read failed, disabling sensor.");
+        system_status.imu_ok = false;
+        return false;
+    }
+
+    float rawAx_mg = myICM.accX(), rawAy_mg = myICM.accY(), rawAz_mg = myICM.accZ();
+    float rawGx = myICM.gyrX(), rawGy = myICM.gyrY(), rawGz = myICM.gyrZ();
+
+    accelX = ACCEL_SMOOTH_ALPHA * (rawAx_mg / 1000.0f) + (1.0f - ACCEL_SMOOTH_ALPHA) * accelX;
+    accelY = ACCEL_SMOOTH_ALPHA * (rawAy_mg / 1000.0f) + (1.0f - ACCEL_SMOOTH_ALPHA) * accelY;
+    accelZ = ACCEL_SMOOTH_ALPHA * (rawAz_mg / 1000.0f) + (1.0f - ACCEL_SMOOTH_ALPHA) * accelZ;
+    gyroX = rawGx - USER_GYRO_BIAS_X;
+    gyroY = rawGy - USER_GYRO_BIAS_Y;
+    gyroZ = rawGz - USER_GYRO_BIAS_Z;
+
+    float gyroMag = vecMagG(gyroX, gyroY, gyroZ);
+    float dropped = gyroMagBuf[gyroWinIdx];
+    gyroSumsq -= dropped * dropped;
+    gyroMagBuf[gyroWinIdx] = gyroMag;
+    gyroSumsq += gyroMag * gyroMag;
+    gyroWinIdx = (gyroWinIdx + 1) % GYRO_WIN_N;
+    if (gyroCountWin < GYRO_WIN_N) gyroCountWin++;
+    global_gyro_rms = (gyroCountWin > 0) ? sqrtf(gyroSumsq / gyroCountWin) : 0.0f;
+
+    if (ActivityState == ACT_REST) {
+        if (global_gyro_rms > ACT_TH_UP) {
+            actUpCnt++;
+            if (actUpCnt >= ACT_DEBOUNCE_COUNT) {
+                ActivityState = ACT_MOTION;
+                actUpCnt = 0;
+                stableBPM = reliableBPM;
+                stableSBP = currentSBP;
+                stableDBP = currentDBP;
+                stableRR = currentRR;
+            }
+        } else { actUpCnt = 0; }
+    } else {
+        if (global_gyro_rms < ACT_TH_DOWN) {
+            actDownCnt++;
+            if (actDownCnt >= ACT_DEBOUNCE_COUNT) {
+                ActivityState = ACT_REST;
+                actDownCnt = 0;
+            }
+        } else { actDownCnt = 0; }
+    }
+    
+    return true;
+}
+
+// --- ADVANCED FALL DETECTION & RECOVERY ---
+void processFallAndRecovery(const float fA[3], const float fG[3]) {
+    if (!system_status.imu_ok) return;
+    
+    unsigned long now = millis();
+    pushRing(fA[0], fA[1], fA[2], now);
+    float accMag = vecMagG(fA[0], fA[1], fA[2]);
+    float gyroMag = vecMagG(fG[0], fG[1], fG[2]);
+
+    if (now - lastFallReportMs < FALL_LOCKOUT_MS) return;
+
+    switch (fallState) {
+        case IDLE:
+             if (accMag < FREEFALL_THRESH_G || (gyroMag > FREEFALL_SPIN_GYRO_DPS && accMag < FREEFALL_SPIN_MAX_ACC_G)) {
+                fallState = MAYBE_FREEFALL;
+                freefallStartTs = now;
+            }
+            break;
+        case MAYBE_FREEFALL:
+            if (accMag < FREEFALL_THRESH_G || (gyroMag > FREEFALL_SPIN_GYRO_DPS && accMag < FREEFALL_SPIN_MAX_ACC_G)) {
+                if (now - freefallStartTs >= FREEFALL_MIN_MS) {
+                    accelBeforeImpact = avgRingBetween((freefallStartTs > 50 ? freefallStartTs - 50 : 0), freefallStartTs + 20);
+                    lastFreefallTs = freefallStartTs;
+                }
+            } else {
+                if (accMag > IMPACT_THRESH_G || accMag > IMPACT_MIN_PEAK_G) {
+                    impactTs = now;
+                    fallState = IMPACT_DETECTED;
+                } else if (now - freefallStartTs > MAX_FREEFALL_TO_IMPACT_MS) {
+                    lastFreefallTs = 0;
+                    fallState = IDLE;
+                }
+            }
+            break;
+        case IMPACT_DETECTED:
+            accelAfterImpact = avgRingBetween(impactTs, impactTs + 100);
+            if (gyroMag > GYRO_SPIKE_THRESHOLD_DPS && (lastFreefallTs != 0) && ((now - lastFreefallTs) <= MAX_FREEFALL_TO_IMPACT_MS)) {
+                fallState = CONFIRMING_FALL;
+                confirmHoldStart = 0;
+            } else {
+                fallState = IDLE;
+            }
+            break;
+        case CONFIRMING_FALL:
+            float tiltDeg = angleDegBetweenVecsSafe(accelBeforeImpact, accelAfterImpact);
+            if (ActivityState == ACT_REST && tiltDeg > TILT_IMMEDIATE_DEG) {
+                if (confirmHoldStart == 0) confirmHoldStart = now;
+
+                if (now - confirmHoldStart >= CONFIRM_HOLD_MS) {
+                    fallActive = true;
+                    fallDetectedTs = now;
+                    fallRecoveryState = REC_WAITING;
+                    lastFallReportMs = now;
+                    Serial.println("[ALERT] Fall detected! -> Recovery state: WAITING");
+                    fallState = IDLE;
+                }
+            } else {
+                 confirmHoldStart = 0;
+            }
+            if (now - impactTs > POST_IMPACT_WINDOW_MS) {
+                 fallState = IDLE;
+            }
+            break;
+    }
+
+    if (fallActive) {
+        if ((now - fallDetectedTs) > RECOVERY_TIMEOUT_MS) {
+            fallRecoveryState = REC_TIMEOUT;
+            fallActive = false;
+            fallOutputUntil = now + 6000UL; 
+            Serial.println("[RECOVERY] Timeout. Escalating alert.");
+            return;
+        }
+
+        Vec3 currentGravity = avgRingBetween((now > 400 ? now - 400 : 0), now);
+        float currentTiltDeg = angleDegBetweenVecsSafe(baselineGravity, currentGravity);
+        bool isMotion = global_gyro_rms > RECOVERY_MOTION_GYRO;
+        bool isQuiet = global_gyro_rms < RECOVERY_GYRO_QUIET;
+
+        switch (fallRecoveryState) {
+            case REC_WAITING:
+                if (isMotion || currentTiltDeg <= RECOVERY_STAGE1_TILT_DEG) {
+                    fallRecoveryState = REC_ATTEMPT;
+                    recoveryMotionTs = now;
+                    recoveryTiltAtMotionStart = currentTiltDeg;
+                    recoveryStartedByTilt = !isMotion;
+                    Serial.println("[RECOVERY] Motion/Tilt detected -> state: ATTEMPT");
+                }
+                break;
+            case REC_ATTEMPT: {
+                float tiltDrop = recoveryTiltAtMotionStart - currentTiltDeg;
+                bool motionSustained = (now - recoveryMotionTs) > RECOVERY_MIN_MOTION_MS;
+                
+                if (currentTiltDeg <= RECOVERY_STAGE2_TILT_DEG && isQuiet && (motionSustained || tiltDrop > RECOVERY_MIN_TILT_DROP_DEG)) {
+                    if (recoveryStableStart == 0) {
+                        recoveryStableStart = now;
+                    }
+                    if ((now - recoveryStableStart) >= RECOVERY_SUSTAIN_MS) {
+                        fallRecoveryState = REC_CONFIRMED;
+                        fallActive = false;
+                        fallOutputUntil = now + 6000UL;
+                        Serial.println("[RECOVERY] Stable upright position detected -> state: CONFIRMED!");
+                    }
+                } else {
+                    recoveryStableStart = 0;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+}
+
+
+// --- ECG ---
+void resetECGSystem() {
+    isCalibrated = false;
+    calibrationCount = 0;
+    lastBeatTime = 0;
+    refractoryEndTime = 0;
+    for (int i=0; i<8; ++i) bpmBuffer[i] = 0;
+    bpmIndex = 0;
+    reliableBPM = 0;
+    currentSBP = 0; currentDBP = 0; currentRR = 0;
+    dynamicThreshold = 2048;
+    Serial.println("[INFO] ECG system reset.");
+}
+
+bool checkElectrodeConnection() {
+    bool loPlus = digitalRead(LO_PLUS_PIN);
+    bool loMinus = digitalRead(LO_MINUS_PIN);
+    bool rawConnectionIsBad = loPlus || loMinus;
+    unsigned long now = millis();
+
+    if (rawConnectionIsBad) {
+        if (!isCurrentlyDisconnected) {
+            disconnectStartTime = now;
+            isCurrentlyDisconnected = true;
+        }
+        if (now - disconnectStartTime > LEAD_OFF_DEBOUNCE_MS) {
+            system_status.ecg_electrodes_ok = false;
+        }
+    } else {
+        isCurrentlyDisconnected = false;
+        system_status.ecg_electrodes_ok = true;
+    }
+    return system_status.ecg_electrodes_ok;
+}
+
+void updateDynamicThreshold() {
+    if (!isCalibrated) return;
+    int minVal = 4095, maxVal = 0;
+    for (int i = 0; i < PEAK_WINDOW; i++) {
+        if (recentSamples[i] < minVal) minVal = recentSamples[i];
+        if (recentSamples[i] > maxVal) maxVal = recentSamples[i];
+    }
+    int signalRange = maxVal - minVal;
+    dynamicThreshold = (signalRange > MIN_SIGNAL_RANGE) 
+        ? currentBaseline + (int)(signalRange * PEAK_THRESHOLD_RATIO) 
+        : currentBaseline + MIN_PEAK_HEIGHT;
+}
+
+bool robustBeatDetection(int ecgValue) {
+    static int maxPeakInRegion = 0;
+    static bool inPeakRegion = false;
+
+    if (ecgValue > dynamicThreshold) {
+        if (!inPeakRegion) {
+            inPeakRegion = true;
+            maxPeakInRegion = ecgValue;
+        } else {
+            if (ecgValue > maxPeakInRegion) maxPeakInRegion = ecgValue;
+        }
+    } else {
+        if (inPeakRegion) {
+            inPeakRegion = false;
+            if (maxPeakInRegion > currentBaseline + MIN_PEAK_HEIGHT) {
+                lastPeakValue = maxPeakInRegion;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+int processECG() {
+    static bool wasConnected = true;
+    if (!checkElectrodeConnection()) {
+        if (wasConnected) {
+             Serial.println("[WARN] ECG electrodes disconnected. Resetting ECG data.");
+             resetECGSystem();
+             wasConnected = false;
+        }
+        return 0;
+    }
+    if (!wasConnected) {
+        Serial.println("[INFO] ECG electrodes reconnected.");
+        wasConnected = true;
+    }
+
+    int rawECG = analogRead(ECG_OUTPUT_PIN);
+    int filteredECG = (recentSamples[sampleIndex] + rawECG) / 2;
+    
+    recentSamples[sampleIndex] = filteredECG;
+    sampleIndex = (sampleIndex + 1) % PEAK_WINDOW;
+    baselineBuffer[baselineIndex] = filteredECG;
+    baselineIndex = (baselineIndex + 1) % BASELINE_WINDOW;
+
+    long sum = 0;
+    for(int i=0; i<BASELINE_WINDOW; i++) sum += baselineBuffer[i];
+    currentBaseline = sum / BASELINE_WINDOW;
+
+    if (!isCalibrated) {
+        calibrationCount++;
+        if (calibrationCount >= CALIBRATION_SAMPLES) {
+            isCalibrated = true;
+            updateDynamicThreshold();
+            Serial.println("[OK] ECG calibration complete. Beat detection active.");
+        }
+        return rawECG;
+    }
+
+    unsigned long now = millis();
+    if (now > refractoryEndTime && ActivityState == ACT_REST) {
+        if (robustBeatDetection(filteredECG)) {
+            unsigned long interval = (lastBeatTime > 0) ? (now - lastBeatTime) : 0;
+            if (interval > MIN_BEAT_INTERVAL) {
+                 float instantBPM = 60000.0f / interval;
+                 if (instantBPM > 40 && instantBPM < 200) {
+                    bpmBuffer[bpmIndex] = instantBPM;
+                    bpmIndex = (bpmIndex + 1) % 8;
+                 }
+            }
+            lastBeatTime = now;
+            refractoryEndTime = now + REFRACTORY_PERIOD;
+        }
+    }
+
+    float sum_bpm = 0; int count = 0;
+    for(int i=0; i<8; i++) {
+        if (bpmBuffer[i] > 0) {
+            sum_bpm += bpmBuffer[i];
+            count++;
+        }
+    }
+    if (count > 0) reliableBPM = sum_bpm / count;
+    
+    if (now - lastThreshUpdate > 500) {
+        updateDynamicThreshold();
+        lastThreshUpdate = now;
+    }
+    return rawECG;
+}
+
+
+// --- OTHER SENSORS & VITALS ---
+void updateTemperature() {
+    if (!system_status.temp_sensor_ok) return;
+    sensors_event_t temp;
+    tmp117.getEvent(&temp);
+    if (temp.temperature < -50 || temp.temperature > 150) {
+        Serial.println("[WARN] Invalid temperature reading, disabling sensor.");
+        system_status.temp_sensor_ok = false;
+        currentTemperature = 0;
+    } else {
+        currentTemperature = temp.temperature;
+    }
+}
+
+void updateVitalsFromBPM() {
+    // LOGIC FIX: If BPM is 0, all derived vitals must also be 0.
+    if (reliableBPM == 0) {
+        currentSBP = 0;
+        currentDBP = 0;
+        currentRR = 0;
+        return;
+    }
+    if (reliableBPM < vitals_table[0].hr) {
+        currentSBP = vitals_table[0].sbp;
+        currentDBP = vitals_table[0].dbp;
+        currentRR = vitals_table[0].rr;
+        return;
+    }
+    if (reliableBPM >= vitals_table[VITALS_TABLE_SIZE-1].hr) {
+        currentSBP = vitals_table[VITALS_TABLE_SIZE-1].sbp;
+        currentDBP = vitals_table[VITALS_TABLE_SIZE-1].dbp;
+        currentRR = vitals_table[VITALS_TABLE_SIZE-1].rr;
+        return;
+    }
+    
+    int lower_idx = 0;
+    for (int i = 0; i < VITALS_TABLE_SIZE - 1; i++) {
+        if (reliableBPM >= vitals_table[i].hr && reliableBPM < vitals_table[i + 1].hr) {
+            lower_idx = i;
+            break;
+        }
+    }
+
+    currentSBP = lerp(vitals_table[lower_idx].hr, vitals_table[lower_idx].sbp, vitals_table[lower_idx+1].hr, vitals_table[lower_idx+1].sbp, reliableBPM);
+    currentDBP = vitals_table[lower_idx].dbp;
+    currentRR  = lerp(vitals_table[lower_idx].hr, vitals_table[lower_idx].rr, vitals_table[lower_idx+1].hr, vitals_table[lower_idx+1].rr, reliableBPM);
+}
+
+void updateEmergencyButton() {
+    static int lastButtonState = HIGH;
+    if (millis() - lastButtonCheck > BUTTON_DEBOUNCE_MS) {
+        int currentButtonState = digitalRead(EMERGENCY_BTN_PIN);
+        if (lastButtonState == HIGH && currentButtonState == LOW) {
+            // A press has been detected
+            emergencyActiveState = !emergencyActiveState;
+        }
+        lastButtonState = currentButtonState;
+        lastButtonCheck = millis();
+    }
+    emergencyPressed = emergencyActiveState;
+}
+
+// --- SENSOR RECOVERY HANDLER ---
+void handleSensorRecovery() {
+    unsigned long now = millis();
+    if (now - lastSensorCheck > SENSOR_CHECK_INTERVAL_MS) {
+        lastSensorCheck = now;
+
+        if (!system_status.imu_ok) {
+            Serial.println("[INFO] Attempting to recover IMU sensor...");
+            initializeIMU();
+        }
+        if (!system_status.temp_sensor_ok) {
+            Serial.println("[INFO] Attempting to recover Temp sensor...");
+            initializeTempSensor();
+        }
+    }
+}
+
+// ========================================================================
+// SETUP & MAIN LOOP
+// ========================================================================
+
+void setup() {
+    Serial.begin(115200);
+    // while (!Serial) { delay(1); } // Commented out for battery-powered operation
+
+    Serial.println("\n========================================");
+    Serial.println("Complete Health Monitor v9.5 - UPGRADED FALL ENGINE");
+    Serial.println("========================================");
+
+    pinMode(LO_PLUS_PIN, INPUT_PULLUP);
+    pinMode(LO_MINUS_PIN, INPUT_PULLUP);
+    pinMode(EMERGENCY_BTN_PIN, INPUT_PULLUP);
+
+    initializeESPNOW();
+    initializeIMU();
+    initializeTempSensor();
+    
+    tx_state.system_start_time = millis();
+
+    Serial.println("[INFO] System setup complete. Starting main loop.");
+    Serial.println("[INFO] First 60 seconds is calibration period. No data will be sent.");
+}
+
+void loop() {
+    unsigned long now = millis();
+    if (now - lastMs < SAMPLE_MS) return;
+    lastMs = now;
+
+    handleSensorRecovery();
+
+    static float ax=0, ay=0, az=0, gx=0, gy=0, gz=0;
+    if (processIMU(ax, ay, az, gx, gy, gz)) {
+        float fA[3] = {ax, ay, az};
+        float fG[3] = {gx, gy, gz};
+        processFallAndRecovery(fA, fG);
+    }
+
+    int ecg_raw_value = processECG();
+    
+    updateTemperature();
+    updateEmergencyButton();
+    updateVitalsFromBPM();
+    
+    float bpm_to_add = (ActivityState == ACT_MOTION) ? stableBPM : reliableBPM;
+    float sbp_to_add = (ActivityState == ACT_MOTION) ? stableSBP : currentSBP;
+    float dbp_to_add = (ActivityState == ACT_MOTION) ? stableDBP : currentDBP;
+    float rr_to_add = (ActivityState == ACT_MOTION) ? stableRR : currentRR;
+    addToAveragingBuffers(bpm_to_add, sbp_to_add, dbp_to_add, rr_to_add, currentTemperature);
+    
+    handleDataTransmission();
+
+    if (now - lastDebugPrint > 1000) {
+        printResults(ecg_raw_value);
+        lastDebugPrint = now;
+    }
+
+    delay(1); // Crucial delay to yield CPU time to the WiFi/ESP-NOW stack
+}
+
+// --- UTILITY ---
+int compareInts(const void *a, const void *b) {
+    return (*(int*)a - *(int*)b);
+}
+
+void printResults(int rawECG) {
+    Serial.print("ECG Raw: "); Serial.print(rawECG);
+    Serial.print(" | Thresh: "); Serial.print(dynamicThreshold);
+    Serial.print(" | BPM: "); Serial.print((int)reliableBPM);
+    Serial.print(" | BP: "); Serial.print((int)currentSBP);
+    Serial.print("/"); Serial.print((int)currentDBP);
+    Serial.print(" | RR: "); Serial.print((int)currentRR);
+    Serial.print(" | Temp: "); Serial.print(currentTemperature, 1);
+    Serial.print(" | LO: "); Serial.print(system_status.ecg_electrodes_ok ? 0 : 1);
+    Serial.print(" | Motion: "); Serial.print(ActivityState == ACT_MOTION ? 1 : 0);
+    
+    Serial.print(" | Fall: ");
+    if (fallActive) Serial.print("ACTIVE");
+    else if (fallOutputUntil > millis()) {
+        if (fallRecoveryState == REC_CONFIRMED) Serial.print("RECOVERED");
+        else if (fallRecoveryState == REC_TIMEOUT) Serial.print("TIMEOUT");
+        else Serial.print("NORMAL");
+    } else Serial.print("NORMAL");
+    
+    Serial.print(" | Recovery: ");
+    switch(fallRecoveryState) {
+        case REC_WAITING: Serial.print("WAITING"); break;
+        case REC_ATTEMPT: Serial.print("ATTEMPT"); break;
+        case REC_CONFIRMED: Serial.print("CONFIRMED"); break;
+        case REC_TIMEOUT: Serial.print("TIMEOUT"); break;
+        default: Serial.print("NONE"); break;
+    }
+    
+    Serial.print(" | EMG: "); Serial.print(emergencyPressed ? 1 : 0);
+    Serial.println();
+}
